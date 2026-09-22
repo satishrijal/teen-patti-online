@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Teen Patti Online</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div id="app">
+  <header id="topbar">
+    <div class="brand">🎴 Teen Patti</div>
+    <div class="top-actions">
+      <button id="btn-mute" class="icon-btn" title="Sound on/off">🔊</button>
+      <button id="btn-leave" class="icon-btn" title="Leave room" hidden>🚪</button>
+    </div>
+  </header>
+
+  <!-- ============ HOME ============ -->
+  <section id="screen-home" class="screen">
+    <div class="card-panel home-panel">
+      <h1>🎴 Teen Patti Online</h1>
+      <p class="subtitle">Real-time multiplayer card nights with friends.<br>Virtual chips only — just for fun.</p>
+      <div id="rejoin-box" hidden>
+        <button id="btn-rejoin" class="btn primary big"></button>
+        <button id="btn-forget" class="link-btn">forget this session</button>
+      </div>
+      <div class="tabs">
+        <button class="tab active" data-tab="create">Create Room</button>
+        <button class="tab" data-tab="join">Join Room</button>
+      </div>
+      <div id="tab-create" class="tab-body">
+        <label>Your name<input id="in-create-name" maxlength="16" placeholder="e.g. Satish" autocomplete="off"></label>
+        <button id="btn-create" class="btn primary big">Create Private Room</button>
+      </div>
+      <div id="tab-join" class="tab-body" hidden>
+        <label>Room code<input id="in-join-code" maxlength="6" placeholder="e.g. XK7Q2P" autocomplete="off" autocapitalize="characters"></label>
+        <label>Your name<input id="in-join-name" maxlength="16" placeholder="e.g. Satish" autocomplete="off"></label>
+        <button id="btn-join" class="btn primary big">Join Room</button>
+      </div>
+      <p id="home-error" class="error" hidden></p>
+      <div class="howto">
+        <h3>How it works</h3>
+        <ol>
+          <li>Create a room and share the 6-letter code with friends.</li>
+          <li>Everyone joins, taps <b>Ready</b>, and the host starts.</li>
+          <li>Everyone starts <b>BLIND</b> — peek with <b>See Cards</b> any time.</li>
+          <li>Blind bets 1×, seen players chaal 2×. Last one standing (or best hand at showdown) takes the pot.</li>
+        </ol>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ LOBBY ============ -->
+  <section id="screen-lobby" class="screen" hidden>
+    <div class="card-panel lobby-panel">
+      <div class="room-code-box">
+        <div class="room-code-label">ROOM CODE — share it with friends</div>
+        <div class="room-code" id="lobby-code">------</div>
+        <button id="btn-copy-code" class="btn small">📋 Copy</button>
+      </div>
+      <h2>Players <span id="lobby-count"></span></h2>
+      <ul id="lobby-players" class="player-list"></ul>
+      <div class="lobby-actions">
+        <button id="btn-ready" class="btn primary big">I'm Ready ✓</button>
+        <button id="btn-start" class="btn gold big" hidden>▶ Start Game</button>
+        <button id="btn-refill" class="btn small" hidden>🪙 Refill 1000 chips</button>
+      </div>
+      <p id="lobby-hint" class="hint"></p>
+    </div>
+  </section>
+
+  <!-- ============ TABLE ============ -->
+  <section id="screen-table" class="screen" hidden>
+    <div id="table-wrap">
+      <div id="table-felt"></div>
+      <div id="pot-area">
+        <div id="pot-chips">🪙</div>
+        <div id="pot-amount">0</div>
+        <div id="stake-line">Stake: <span id="stake-amount">0</span></div>
+      </div>
+      <div id="seats"></div>
+      <button id="btn-feed-toggle" class="icon-btn">📜</button>
+      <aside id="feed" class="open"><div id="feed-items"></div></aside>
+    </div>
+    <div id="hand-area">
+      <div id="my-cards"></div>
+      <div id="action-bar"></div>
+      <div id="turn-banner" hidden></div>
+    </div>
+  </section>
+</div>
+
+<div id="modal-root"></div>
+<div id="toast-root"></div>
+<script src="client.js"></script>
+</body>
+</html>
