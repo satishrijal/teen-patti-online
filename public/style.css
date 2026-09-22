@@ -258,8 +258,18 @@ body {
 .toast.err { border-color: var(--red); background: rgba(120,30,22,.95); }
 @keyframes toastIn { from { transform: translateY(12px); opacity: 0; } }
 
-/* ---------- responsive ---------- */
-@media (max-width: 640px) {
+/* ---------- login / auth ---------- */
+#login-form label { display: block; margin: 10px 0; font-size: .95rem; color: var(--muted); }
+#login-form input {
+  display: block; width: 100%; margin-top: 6px; padding: 13px 14px; font-size: 1.1rem;
+  border-radius: 12px; border: 1px solid #33404e; background: #12181f; color: var(--text);
+}
+.auth-user {
+  align-self: center; font-size: .85rem; color: var(--gold); font-weight: 700;
+  max-width: 110px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+
+/* ---------- responsive ---------- */@media (max-width: 640px) {
   #table-wrap { min-height: 380px; }
   .seat { width: 70px; }
   .seat .avatar { width: 38px; height: 38px; font-size: 1.05rem; }

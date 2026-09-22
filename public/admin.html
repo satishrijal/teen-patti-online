@@ -1,0 +1,270 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Teen Patti — Admin</title>
+<style>
+  /* Teen Patti admin backend. Virtual chips only, no real money. */
+  :root { --bg:#101418; --panel:#1b222b; --panel-2:#232d38; --text:#f2f5f7;
+          --muted:#9aa7b4; --gold:#f5c542; --red:#e74c3c; --green:#2ecc71; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text);
+         font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif; }
+  .wrap { max-width:900px; margin:0 auto; padding:18px 14px 40px; }
+  .card { background:var(--panel); border:1px solid #2c3947; border-radius:16px;
+          padding:22px 20px; margin:14px 0; box-shadow:0 10px 30px rgba(0,0,0,.4); }
+  h1 { margin:0 0 4px; font-size:1.6rem; }
+  h2 { margin:0 0 12px; font-size:1.15rem; }
+  .sub { color:var(--muted); margin:0 0 10px; font-size:.92rem; }
+  label { display:block; margin:10px 0; font-size:.9rem; color:var(--muted); }
+  input[type=text], input[type=password], input[type=number] {
+    display:block; width:100%; margin-top:6px; padding:11px 12px; font-size:1rem;
+    border-radius:10px; border:1px solid #33404e; background:#12181f; color:var(--text); }
+  .row { display:flex; gap:10px; flex-wrap:wrap; }
+  .row > * { flex:1 1 140px; }
+  .btn { border:1px solid #33404e; background:var(--panel-2); color:var(--text);
+         border-radius:10px; padding:10px 14px; font-size:.95rem; font-weight:600; cursor:pointer; }
+  .btn:active { transform:scale(.97); }
+  .btn.primary { background:#2f7d4f; border-color:#2f7d4f; }
+  .btn.gold { background:linear-gradient(180deg,var(--gold),#b98a1c); color:#231a04; border:none; }
+  .btn.danger { background:rgba(231,76,60,.15); border-color:var(--red); color:#ff9a8a; }
+  .btn.small { padding:6px 10px; font-size:.82rem; }
+  .btn:disabled { opacity:.45; cursor:not-allowed; }
+  .error { color:#ff8a7a; background:rgba(231,76,60,.12); border:1px solid rgba(231,76,60,.4);
+           padding:10px 12px; border-radius:10px; }
+  .notice { color:#7be2a8; background:rgba(46,204,113,.1); border:1px solid rgba(46,204,113,.35);
+            padding:10px 12px; border-radius:10px; }
+  table { width:100%; border-collapse:collapse; font-size:.92rem; }
+  th, td { text-align:left; padding:9px 8px; border-bottom:1px solid #2c3947; vertical-align:middle; }
+  th { color:var(--muted); font-size:.78rem; text-transform:uppercase; letter-spacing:.5px; }
+  .pill { display:inline-block; font-size:.72rem; font-weight:700; padding:3px 9px; border-radius:12px; }
+  .pill.admin { background:rgba(245,197,66,.15); color:var(--gold); }
+  .pill.off { background:rgba(231,76,60,.15); color:#ff9a8a; }
+  .bal { color:var(--gold); font-weight:700; white-space:nowrap; }
+  .actions { display:flex; gap:6px; flex-wrap:wrap; align-items:center; }
+  .amt { width:92px !important; display:inline-block !important; margin-top:0 !important;
+         padding:7px 9px !important; font-size:.85rem !important; }
+  #toast-root { position:fixed; bottom:18px; left:50%; transform:translateX(-50%); z-index:200;
+                display:flex; flex-direction:column; gap:8px; align-items:center; }
+  .toast { background:#2b3644; border:1px solid #46586c; color:var(--text); padding:10px 18px;
+           border-radius:24px; font-size:.92rem; max-width:92vw; text-align:center; }
+  .toast.err { border-color:var(--red); background:rgba(120,30,22,.95); }
+  .topbar { display:flex; justify-content:space-between; align-items:center; margin-bottom:6px; }
+  @media (max-width:640px) { table { font-size:.82rem; } th:nth-child(4), td:nth-child(4){ display:none; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="topbar">
+    <h1>🎴 Teen Patti — Admin</h1>
+    <button id="btn-logout" class="btn small" hidden>⏻ Log out</button>
+  </div>
+  <p class="sub">Create logins for your friends and load virtual chips onto their accounts. Play money only.</p>
+
+  <!-- LOGIN -->
+  <div id="view-login" class="card">
+    <h2>Admin login</h2>
+    <label>Username<input id="in-user" autocomplete="username" placeholder="admin"></label>
+    <label>Password<input id="in-pass" type="password" autocomplete="current-password" placeholder="••••••••"></label>
+    <button id="btn-login" class="btn primary">Log In</button>
+    <p id="login-error" class="error" hidden></p>
+  </div>
+
+  <!-- PANEL -->
+  <div id="view-panel" hidden>
+    <div id="panel-notice"></div>
+    <div class="card">
+      <h2>➕ Create player account</h2>
+      <div class="row">
+        <label>Username<input id="in-new-user" maxlength="16" placeholder="e.g. ramesh" autocomplete="off"></label>
+        <label>Password<input id="in-new-pass" type="password" placeholder="at least 4 characters" autocomplete="off"></label>
+      </div>
+      <button id="btn-create" class="btn primary">Create Account</button>
+      <p class="sub" style="margin-top:10px">New accounts start with 0 chips — load chips below after creating.</p>
+    </div>
+    <div class="card">
+      <h2>👥 Accounts</h2>
+      <table>
+        <thead><tr><th>Username</th><th>Chips</th><th>Status</th><th>Created</th><th>Actions</th></tr></thead>
+        <tbody id="user-rows"></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+<div id="toast-root"></div>
+
+<script>
+/* Teen Patti admin panel client. Virtual chips only, no real money. */
+(() => {
+'use strict';
+const $ = (s) => document.querySelector(s);
+const esc = (s) => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+let ws = null, authed = false, isAdmin = false, myUser = null;
+
+function toast(text, isErr) {
+  const t = document.createElement('div');
+  t.className = 'toast' + (isErr ? ' err' : '');
+  t.textContent = text;
+  $('#toast-root').appendChild(t);
+  setTimeout(() => t.remove(), 3200);
+}
+function send(o) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(o)); }
+
+function connect() {
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  ws = new WebSocket(`${proto}://${location.host}/`);
+  ws.onopen = () => {
+    const t = localStorage.getItem('tp_admin_auth');
+    if (t) send({ type: 'auth', token: t });
+  };
+  ws.onmessage = (ev) => {
+    let m; try { m = JSON.parse(ev.data); } catch (e) { return; }
+    if (m.type === 'auth_ok') {
+      if (!m.isAdmin) {
+        toast('That account is not an admin.', true);
+        localStorage.removeItem('tp_admin_auth');
+        return;
+      }
+      authed = true; isAdmin = true; myUser = m.username;
+      localStorage.setItem('tp_admin_auth', m.token);
+      $('#view-login').hidden = true;
+      $('#view-panel').hidden = false;
+      $('#btn-logout').hidden = false;
+      send({ type: 'admin_list_users' });
+    } else if (m.type === 'auth_fail') {
+      authed = false;
+      localStorage.removeItem('tp_admin_auth');
+      const e = $('#login-error');
+      e.textContent = m.message; e.hidden = false;
+    } else if (m.type === 'admin_users') {
+      renderUsers(m.users);
+      if (m.notice) {
+        const n = $('#panel-notice');
+        n.innerHTML = `<p class="notice">${esc(m.notice)}</p>`;
+        setTimeout(() => { n.innerHTML = ''; }, 4000);
+      }
+    } else if (m.type === 'admin_error') {
+      toast(m.message, true);
+    } else if (m.type === 'error') {
+      toast(m.message, true);
+    } else if (m.type === 'logged_out') {
+      doLogoutUI();
+    }
+  };
+  ws.onclose = () => { if (authed) setTimeout(connect, 1500); };
+}
+
+function fmtDate(ts) {
+  try { return new Date(ts).toLocaleDateString(); } catch (e) { return ''; }
+}
+
+function renderUsers(users) {
+  const tb = $('#user-rows');
+  tb.innerHTML = '';
+  for (const u of users) {
+    const tr = document.createElement('tr');
+    const status = u.disabled
+      ? '<span class="pill off">disabled</span>'
+      : (u.isAdmin ? '<span class="pill admin">admin</span>' : '<span class="pill">player</span>');
+    tr.innerHTML = `
+      <td><b>${esc(u.username)}</b></td>
+      <td class="bal">🪙 ${u.balance.toLocaleString()}</td>
+      <td>${status}</td>
+      <td>${fmtDate(u.createdAt)}</td>
+      <td></td>`;
+    const cell = tr.lastChild;
+    const wrap = document.createElement('div');
+    wrap.className = 'actions';
+    const self = (u.username === myUser);
+
+    if (!u.isAdmin || self) {
+      // chip controls (also allowed on self for convenience)
+      const amt = document.createElement('input');
+      amt.className = 'amt'; amt.type = 'number'; amt.min = '1'; amt.placeholder = 'chips';
+      const add = document.createElement('button');
+      add.className = 'btn small gold'; add.textContent = '+ Add';
+      add.onclick = () => {
+        const v = parseInt(amt.value, 10);
+        if (!Number.isInteger(v) || v <= 0) return toast('Enter a positive whole number.', true);
+        send({ type: 'admin_add_chips', username: u.username, amount: v });
+      };
+      const setAmt = document.createElement('input');
+      setAmt.className = 'amt'; setAmt.type = 'number'; setAmt.min = '0'; setAmt.placeholder = 'set…';
+      const set = document.createElement('button');
+      set.className = 'btn small'; set.textContent = 'Set';
+      set.onclick = () => {
+        const v = parseInt(setAmt.value, 10);
+        if (!Number.isInteger(v) || v < 0) return toast('Enter 0 or a positive whole number.', true);
+        if (!confirm(`Set ${u.username}'s balance to ${v} chips?`)) return;
+        send({ type: 'admin_set_balance', username: u.username, amount: v });
+      };
+      wrap.appendChild(amt); wrap.appendChild(add); wrap.appendChild(setAmt); wrap.appendChild(set);
+    }
+    if (!self) {
+      const pw = document.createElement('button');
+      pw.className = 'btn small'; pw.textContent = '🔑 Reset PW';
+      pw.onclick = () => {
+        const np = prompt(`New password for ${u.username} (min 4 chars):`);
+        if (np === null) return;
+        send({ type: 'admin_reset_password', username: u.username, newPassword: np });
+      };
+      const dis = document.createElement('button');
+      dis.className = 'btn small'; dis.textContent = u.disabled ? 'Enable' : 'Disable';
+      dis.onclick = () => {
+        if (!confirm(`${u.disabled ? 'Enable' : 'Disable'} account "${u.username}"?`)) return;
+        send({ type: 'admin_set_disabled', username: u.username, disabled: !u.disabled });
+      };
+      const del = document.createElement('button');
+      del.className = 'btn small danger'; del.textContent = 'Delete';
+      del.onclick = () => {
+        if (!confirm(`Delete account "${u.username}" forever? This cannot be undone.`)) return;
+        send({ type: 'admin_delete_user', username: u.username });
+      };
+      wrap.appendChild(pw); wrap.appendChild(dis); wrap.appendChild(del);
+    } else {
+      const me = document.createElement('span');
+      me.className = 'pill admin'; me.textContent = 'you';
+      wrap.appendChild(me);
+    }
+    cell.appendChild(wrap);
+    tb.appendChild(tr);
+  }
+}
+
+function doLogoutUI() {
+  authed = false; isAdmin = false; myUser = null;
+  localStorage.removeItem('tp_admin_auth');
+  $('#view-login').hidden = false;
+  $('#view-panel').hidden = true;
+  $('#btn-logout').hidden = true;
+}
+
+function init() {
+  const attempt = () => {
+    const username = $('#in-user').value.trim();
+    const password = $('#in-pass').value;
+    if (!username || !password) {
+      const e = $('#login-error'); e.textContent = 'Enter username and password.'; e.hidden = false; return;
+    }
+    if (!ws || ws.readyState !== 1) { toast('Connecting… try again in a second.', true); return; }
+    send({ type: 'login', username, password });
+  };
+  $('#btn-login').addEventListener('click', attempt);
+  $('#in-pass').addEventListener('keydown', e => { if (e.key === 'Enter') attempt(); });
+  $('#btn-create').addEventListener('click', () => {
+    const username = $('#in-new-user').value.trim();
+    const password = $('#in-new-pass').value;
+    if (!username || !password) return toast('Enter a username and password.', true);
+    send({ type: 'admin_create_user', username, password });
+    $('#in-new-user').value = ''; $('#in-new-pass').value = '';
+  });
+  $('#btn-logout').addEventListener('click', () => { send({ type: 'logout' }); doLogoutUI(); });
+  connect();
+}
+document.addEventListener('DOMContentLoaded', init);
+})();
+</script>
+</body>
+</html>

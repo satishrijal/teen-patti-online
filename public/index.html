@@ -11,16 +11,38 @@
   <header id="topbar">
     <div class="brand">🎴 Teen Patti</div>
     <div class="top-actions">
+      <span id="auth-user" class="auth-user" hidden></span>
+      <button id="btn-logout" class="icon-btn" title="Log out" hidden>⏻</button>
       <button id="btn-mute" class="icon-btn" title="Sound on/off">🔊</button>
       <button id="btn-leave" class="icon-btn" title="Leave room" hidden>🚪</button>
     </div>
   </header>
 
+  <!-- ============ LOGIN ============ -->
+  <section id="screen-login" class="screen">
+    <div class="card-panel home-panel">
+      <h1>🎴 Teen Patti Online</h1>
+      <p class="subtitle">Log in with the account your host created for you.<br>Virtual chips only — just for fun.</p>
+      <div id="login-form">
+        <label>Username
+          <input id="in-login-user" maxlength="16" placeholder="username" autocomplete="username">
+        </label>
+        <label>Password
+          <input id="in-login-pass" type="password" placeholder="••••••••" autocomplete="current-password">
+        </label>
+        <button id="btn-login" class="btn primary big">Log In</button>
+        <p id="login-error" class="error" hidden></p>
+        <p class="hint">No account yet? Ask your host (the admin) to create one for you.</p>
+      </div>
+    </div>
+  </section>
+
   <!-- ============ HOME ============ -->
-  <section id="screen-home" class="screen">
+  <section id="screen-home" class="screen" hidden>
     <div class="card-panel home-panel">
       <h1>🎴 Teen Patti Online</h1>
       <p class="subtitle">Real-time multiplayer card nights with friends.<br>Virtual chips only — just for fun.</p>
+      <p class="hint">Playing as <b id="home-username"></b> · <span class="chips">🪙 <span id="home-balance">0</span></span></p>
       <div id="rejoin-box" hidden>
         <button id="btn-rejoin" class="btn primary big"></button>
         <button id="btn-forget" class="link-btn">forget this session</button>
@@ -30,12 +52,10 @@
         <button class="tab" data-tab="join">Join Room</button>
       </div>
       <div id="tab-create" class="tab-body">
-        <label>Your name<input id="in-create-name" maxlength="16" placeholder="e.g. Satish" autocomplete="off"></label>
         <button id="btn-create" class="btn primary big">Create Private Room</button>
       </div>
       <div id="tab-join" class="tab-body" hidden>
         <label>Room code<input id="in-join-code" maxlength="6" placeholder="e.g. XK7Q2P" autocomplete="off" autocapitalize="characters"></label>
-        <label>Your name<input id="in-join-name" maxlength="16" placeholder="e.g. Satish" autocomplete="off"></label>
         <button id="btn-join" class="btn primary big">Join Room</button>
       </div>
       <p id="home-error" class="error" hidden></p>
@@ -64,7 +84,6 @@
       <div class="lobby-actions">
         <button id="btn-ready" class="btn primary big">I'm Ready ✓</button>
         <button id="btn-start" class="btn gold big" hidden>▶ Start Game</button>
-        <button id="btn-refill" class="btn small" hidden>🪙 Refill 1000 chips</button>
       </div>
       <p id="lobby-hint" class="hint"></p>
     </div>

@@ -22,7 +22,6 @@ const crypto = require('crypto');
 /* ------------------------------- config ------------------------------ */
 const PORT = process.env.PORT || 3000;
 const BOOT = 10;                 // ante (chips) every seated player posts each round
-const START_CHIPS = 1000;        // starting balance + broke-player refill (virtual)
 const MAX_PLAYERS = 10;          // seats per room
 const TURN_MS = 30 * 1000;       // turn countdown; auto-pack on timeout
 const SIDESHOW_MS = 15 * 1000;   // side-show accept/decline window
@@ -33,6 +32,18 @@ const AVATAR_COLORS = [
   '#d35400', '#2c3e50', '#27ae60', '#c0392b', '#7f8c8d',
 ];
 const PUBLIC_DIR = path.join(__dirname, 'public');
+
+/* --------------------------- accounts config ------------------------- */
+// Virtual-chip accounts. The admin (Satish) creates logins for friends and
+// loads chips onto them from the /admin panel. Play money only.
+const DATA_DIR = process.env.TP_DATA_DIR || path.join(__dirname, 'data');
+const ACCOUNTS_FILE = path.join(DATA_DIR, 'accounts.json');
+const ADMIN_USER = process.env.ADMIN_USER || 'admin';
+const ADMIN_PASS = process.env.ADMIN_PASS || 'changeme123';
+const SESSION_TTL_MS = 7 * 24 * 3600 * 1000; // login sessions last 7 days
+const MAX_LOGIN_FAILS = 5;                   // then a temporary lockout
+const LOGIN_LOCK_MS = 60 * 1000;             // lockout duration
+const MAX_CHIPS = 1000000000;                // sanity cap on chip amounts
 
 /* -------------------------------- cards ------------------------------ */
 const SUITS = ['S', 'H', 'D', 'C']; // spades, hearts, diamonds, clubs
@@ -105,6 +116,144 @@ function compareHands(a, b) {
   return 0;
 }
 
+/* ------------------------------ accounts ----------------------------- */
+/* Player accounts with login + admin-managed chip balances.
+ * Stored in data/accounts.json, written atomically (tmp file + rename)
+ * so a crash mid-write can never corrupt the file.
+ * Passwords are salted scrypt hashes — hashes never leave the server.  */
+const accounts = new Map();   // lower(username) -> account
+const sessions = new Map();    // session token -> { user, expiresAt }
+const loginFails = new Map();  // lower(username) -> { count, lockedUntil }
+
+function hashPassword(password) {
+  const salt = crypto.randomBytes(16);
+  const hash = crypto.scryptSync(password, salt, 64);
+  return salt.toString('hex') + ':' + hash.toString('hex');
+}
+
+function verifyPassword(password, stored) {
+  const parts = String(stored).split(':');
+  if (parts.length !== 2) return false;
+  try {
+    const salt = Buffer.from(parts[0], 'hex');
+    const expected = Buffer.from(parts[1], 'hex');
+    const actual = crypto.scryptSync(password, salt, 64);
+    return actual.length === expected.length && crypto.timingSafeEqual(actual, expected);
+  } catch (e) { return false; }
+}
+
+function loadAccounts() {
+  accounts.clear();
+  try {
+    const raw = fs.readFileSync(ACCOUNTS_FILE, 'utf8');
+    const list = JSON.parse(raw);
+    if (Array.isArray(list)) {
+      for (const a of list) {
+        if (a && typeof a.username === 'string' && typeof a.hash === 'string') {
+          accounts.set(a.username.toLowerCase(), {
+            username: a.username,
+            hash: a.hash,
+            isAdmin: !!a.isAdmin,
+            balance: Math.max(0, Math.floor(a.balance) || 0),
+            createdAt: a.createdAt || Date.now(),
+            disabled: !!a.disabled,
+          });
+        }
+      }
+    }
+  } catch (e) {
+    if (e.code !== 'ENOENT') console.error('Could not load accounts:', e.message);
+    // Missing file = first run; it will be created on first save.
+  }
+}
+
+// Atomic write: write to a temp file, then rename over the real one.
+function persistAccounts() {
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+  const tmp = ACCOUNTS_FILE + '.tmp-' + process.pid;
+  fs.writeFileSync(tmp, JSON.stringify([...accounts.values()], null, 2));
+  fs.renameSync(tmp, ACCOUNTS_FILE);
+}
+
+// Public view of an account — the password hash is NEVER included.
+function publicUser(a) {
+  return {
+    username: a.username,
+    isAdmin: !!a.isAdmin,
+    balance: a.balance,
+    createdAt: a.createdAt,
+    disabled: !!a.disabled,
+  };
+}
+
+function validateCredentials(username, password) {
+  const u = String(username || '').trim();
+  const p = String(password || '');
+  if (!/^[A-Za-z0-9_]{3,16}$/.test(u)) {
+    return 'Username must be 3–16 characters: letters, numbers, underscore.';
+  }
+  if (p.length < 4) return 'Password must be at least 4 characters.';
+  return null;
+}
+
+// Create the admin account on first run from env vars.
+function bootstrapAdmin() {
+  const key = ADMIN_USER.toLowerCase();
+  if (!accounts.has(key)) {
+    accounts.set(key, {
+      username: ADMIN_USER,
+      hash: hashPassword(ADMIN_PASS),
+      isAdmin: true,
+      balance: 0,
+      createdAt: Date.now(),
+      disabled: false,
+    });
+    persistAccounts();
+    console.log(`Admin account created: "${ADMIN_USER}".`);
+  }
+  if (!process.env.ADMIN_PASS || process.env.ADMIN_PASS === 'changeme123') {
+    console.warn('!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!');
+    console.warn('!! WARNING: the admin account is using the DEFAULT password !!');
+    console.warn('!! Set ADMIN_USER and ADMIN_PASS env vars and restart.     !!');
+    console.warn('!! On Render: Dashboard -> your service -> Environment.    !!');
+    console.warn('!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!');
+  }
+}
+
+// Copy the account's current chip balance onto every in-room seat it holds,
+// then refresh those rooms. Used after admin chip changes.
+function applyBalanceToRooms(userKey) {
+  const acct = accounts.get(userKey);
+  if (!acct) return;
+  const touched = new Set();
+  for (const room of rooms.values()) {
+    for (const p of room.players.values()) {
+      if (p.accountName === userKey) {
+        p.balance = acct.balance;
+        touched.add(room);
+      }
+    }
+  }
+  for (const room of touched) sendState(room);
+}
+
+// Copy an in-room player's balance back onto their account (no disk write).
+function syncBalanceToAccount(p) {
+  if (!p || !p.accountName) return;
+  const acct = accounts.get(p.accountName);
+  if (acct) acct.balance = Math.max(0, Math.floor(p.balance));
+}
+
+// Drop every login session + socket + room seat for an account.
+function kickAccountEverywhere(userKey, reason) {
+  for (const [t, s] of sessions) if (s.user === userKey) sessions.delete(t);
+  for (const room of [...rooms.values()]) {
+    for (const p of [...room.players.values()]) {
+      if (p.accountName === userKey) removePlayer(room, p.id, reason);
+    }
+  }
+}
+
 /* -------------------------------- rooms ------------------------------ */
 const rooms = new Map();      // roomCode -> room
 const tokenIndex = new Map(); // player token -> { code, playerId } (for reconnect)
@@ -133,18 +282,19 @@ function newRoom(code) {
   };
 }
 
-function newPlayer(name, colorIdx) {
+function newPlayer(name, colorIdx, balance, accountName) {
   return {
     id: crypto.randomBytes(8).toString('hex'),
     token: crypto.randomBytes(16).toString('hex'),
     name: String(name || 'Player').trim().slice(0, 16) || 'Player',
+    accountName: accountName || null, // lower(username); chips live on the account
     color: AVATAR_COLORS[colorIdx % AVATAR_COLORS.length],
     ws: null,
     connected: false,
     disconnectedAt: null,
     isHost: false,
     ready: false,
-    balance: START_CHIPS,
+    balance: Math.max(0, Math.floor(balance) || 0), // loaded from the account
     // per-round fields:
     inRound: false,
     packed: false,
@@ -171,9 +321,11 @@ function activePlayers(room) {
 }
 
 /* ------------------------------ messaging ---------------------------- */
-function send(p, obj) {
-  if (p.ws && p.ws.readyState === 1) {
-    try { p.ws.send(JSON.stringify(obj)); } catch (e) { /* ignore */ }
+function send(target, obj) {
+  // Accepts either a player object (uses player.ws) or a raw WebSocket.
+  const sock = target && target.ws ? target.ws : target;
+  if (sock && sock.readyState === 1) {
+    try { sock.send(JSON.stringify(obj)); } catch (e) { /* ignore */ }
   }
 }
 
@@ -270,6 +422,9 @@ function removePlayer(room, playerId, reason) {
     try { p.ws.send(JSON.stringify({ type: 'kicked', reason: reason || 'removed' })); } catch (e) {}
     try { p.ws.close(); } catch (e) {}
   }
+  // Chips live on the player's account: write the seat's balance back.
+  syncBalanceToAccount(p);
+  persistAccounts();
   room.players.delete(playerId);
   tokenIndex.delete(p.token);
   room.order = room.order.filter(id => id !== playerId);
@@ -301,6 +456,94 @@ function removePlayer(room, playerId, reason) {
   sendState(room);
 }
 
+/* --------------------------- auth (login) ---------------------------- */
+// Sockets must authenticate before doing anything else. Two ways in:
+//   {type:"login", username, password}  -> fresh login, returns auth_ok
+//   {type:"auth", token}                -> resume with a saved session token
+
+function bindAccount(ws, acct, token) {
+  ws.account = { user: acct.username.toLowerCase(), username: acct.username, isAdmin: !!acct.isAdmin };
+  ws.sessionToken = token;
+  send(ws, {
+    type: 'auth_ok', token,
+    username: acct.username, isAdmin: !!acct.isAdmin, balance: acct.balance,
+  });
+}
+
+function onLogin(ws, msg) {
+  const name = String(msg.username || '').trim();
+  const password = String(msg.password || '');
+  const key = name.toLowerCase();
+  const now = Date.now();
+
+  // Brute-force protection: 5 bad attempts -> 60s lockout for that username.
+  const lf = loginFails.get(key);
+  if (lf && lf.lockedUntil > now) {
+    const secs = Math.ceil((lf.lockedUntil - now) / 1000);
+    return send(ws, { type: 'auth_fail', message: `Too many failed attempts. Try again in ${secs}s.` });
+  }
+
+  const acct = accounts.get(key);
+  const ok = acct && !acct.disabled && verifyPassword(password, acct.hash);
+  if (!ok) {
+    const e = loginFails.get(key) || { count: 0, lockedUntil: 0 };
+    e.count += 1;
+    if (e.count >= MAX_LOGIN_FAILS) { e.count = 0; e.lockedUntil = now + LOGIN_LOCK_MS; }
+    loginFails.set(key, e);
+    const reason = (acct && acct.disabled)
+      ? 'This account is disabled. Ask the admin.'
+      : 'Invalid username or password.';
+    return send(ws, { type: 'auth_fail', message: reason });
+  }
+
+  loginFails.delete(key);
+  const token = crypto.randomBytes(32).toString('hex');
+  sessions.set(token, { user: key, expiresAt: now + SESSION_TTL_MS });
+  bindAccount(ws, acct, token);
+}
+
+function onAuthToken(ws, msg) {
+  const token = String(msg.token || '');
+  const s = sessions.get(token);
+  if (!s) return send(ws, { type: 'auth_fail', message: 'Session expired. Please log in again.' });
+  if (s.expiresAt < Date.now()) {
+    sessions.delete(token);
+    return send(ws, { type: 'auth_fail', message: 'Session expired. Please log in again.' });
+  }
+  const acct = accounts.get(s.user);
+  if (!acct || acct.disabled) {
+    sessions.delete(token);
+    return send(ws, { type: 'auth_fail', message: 'Account unavailable. Please log in again.' });
+  }
+  bindAccount(ws, acct, token);
+}
+
+function onLogout(ws) {
+  // Write chips back and leave any room before dropping the session.
+  const ref = ws.playerRef;
+  const acctUser = ws.account && ws.account.user;
+  if (ref) {
+    const room = rooms.get(ref.roomCode);
+    const p = room && room.players.get(ref.playerId);
+    if (room && p && (!p.accountName || p.accountName === acctUser)) {
+      removePlayer(room, p.id, 'logged out');
+    }
+  }
+  if (ws.sessionToken) sessions.delete(ws.sessionToken);
+  ws.account = null;
+  ws.sessionToken = null;
+  ws.playerRef = null;
+  send(ws, { type: 'logged_out' });
+}
+
+// Reload a seated player's balance from their account (admin may have
+// topped it up while they waited). No-op if the account is gone.
+function refreshBalance(p) {
+  if (!p || !p.accountName) return;
+  const acct = accounts.get(p.accountName);
+  if (acct) p.balance = acct.balance;
+}
+
 /* --------------------------- join / lobby ---------------------------- */
 function attach(ws, room, player) {
   if (player.ws && player.ws !== ws && player.ws.readyState === 1) {
@@ -313,11 +556,12 @@ function attach(ws, room, player) {
 }
 
 function onCreateRoom(ws, msg) {
-  const name = String(msg.name || '').trim();
-  if (!name) return sendError(ws, 'Please enter your name.');
+  const acct = ws.account && accounts.get(ws.account.user);
+  if (!acct) return sendError(ws, 'Account not found. Please log in again.');
+  const name = acct.username; // room name = account username (unique by design)
   const code = makeCode();
   const room = newRoom(code);
-  const player = newPlayer(name, 0);
+  const player = newPlayer(name, 0, acct.balance, ws.account.user);
   player.isHost = true;
   room.players.set(player.id, player);
   room.order.push(player.id);
@@ -330,32 +574,34 @@ function onCreateRoom(ws, msg) {
 }
 
 function onJoinRoom(ws, msg) {
+  const acct = ws.account && accounts.get(ws.account.user);
+  if (!acct) return sendError(ws, 'Account not found. Please log in again.');
   const code = String(msg.code || '').trim().toUpperCase();
   const room = rooms.get(code);
   if (!room) return sendError(ws, 'Room not found. Check the code and try again.');
 
-  // Reconnect with a previously issued token: seat + hand are restored.
+  // Reconnect with a previously issued token: seat + hand are restored,
+  // but only if the seat belongs to this account.
   if (msg.token) {
     const rec = tokenIndex.get(msg.token);
     if (rec && rec.code === code) {
       const player = room.players.get(rec.playerId);
-      if (player) {
+      if (player && player.accountName === ws.account.user) {
         attach(ws, room, player);
         feed(room, `${player.name} reconnected.`);
         sendState(room);
         return;
       }
     }
-    // Unknown/expired token: fall through to fresh join.
+    // Unknown/expired token, or another account's seat: fresh join below.
   }
 
-  const name = String(msg.name || '').trim();
-  if (!name) return sendError(ws, 'Please enter your name.');
+  const name = acct.username;
   if (room.players.size >= MAX_PLAYERS) return sendError(ws, 'This room is full (10 players).');
   const taken = [...room.players.values()].some(p => p.name.toLowerCase() === name.toLowerCase());
-  if (taken) return sendError(ws, 'That name is taken in this room. Pick another.');
+  if (taken) return sendError(ws, 'You are already in this room on another connection.');
 
-  const player = newPlayer(name, room.order.length);
+  const player = newPlayer(name, room.order.length, acct.balance, ws.account.user);
   room.players.set(player.id, player);
   room.order.push(player.id);
   tokenIndex.set(player.token, { code, playerId: player.id });
@@ -371,8 +617,9 @@ function onToggleReady(ws) {
   const room = rooms.get(ref.roomCode);
   const p = room && room.players.get(ref.playerId);
   if (!room || !p || room.phase !== 'lobby') return;
+  refreshBalance(p); // the admin may have loaded chips while this player waited
   if (!p.ready && p.balance < BOOT) {
-    sendError(ws, `You need at least ${BOOT} chips to play. Hit Refill.`);
+    sendError(ws, `You need at least ${BOOT} chips to play. Ask the admin to load chips for you.`);
     return;
   }
   p.ready = !p.ready;
@@ -382,6 +629,8 @@ function onToggleReady(ws) {
 
 /* ------------------------------ rounds ------------------------------- */
 function startRound(room) {
+  // Balances live on accounts: reload them so admin top-ups apply.
+  for (const p of room.players.values()) refreshBalance(p);
   const contenders = room.order
     .map(id => room.players.get(id))
     .filter(p => p && p.connected && p.ready && p.balance >= BOOT);
@@ -506,7 +755,10 @@ function endRound(room, opts) {
     p.inRound = false; p.packed = false; p.seen = false;
     p.hand = null; p.betInRound = 0; p.allIn = false;
     p.lastAction = ''; p.ready = false;
+    // Chips live on accounts: write every seat's balance back now.
+    syncBalanceToAccount(p);
   }
+  persistAccounts();
   room.round = null;
   room.phase = 'lobby';
   sendState(room);
@@ -692,19 +944,11 @@ function doShow(room, p) {
 
 function doPlayAgain(room, p) {
   if (room.phase !== 'lobby') return 'Finish the round first.';
-  if (p.balance < BOOT) return 'You need chips to play — hit Refill first.';
+  refreshBalance(p);
+  if (p.balance < BOOT) return 'You need chips to play — ask the admin to load some.';
   p.ready = true;
   room.lastResult = null;
   feed(room, `${p.name} wants to play again.`);
-  sendState(room);
-  return null;
-}
-
-function doRefill(room, p) {
-  if (room.phase !== 'lobby') return 'Refill is only available in the lobby.';
-  if (p.balance >= BOOT) return 'You still have chips.';
-  p.balance += START_CHIPS;
-  feed(room, `${p.name} refilled ${START_CHIPS} chips.`);
   sendState(room);
   return null;
 }
@@ -728,9 +972,111 @@ function doRemovePlayer(room, p, targetId) {
   return null;
 }
 
+/* ------------------------------ admin -------------------------------- */
+// Every admin_* message requires an authenticated admin socket.
+// Non-admin sockets are rejected here, no exceptions.
+function handleAdmin(ws, msg) {
+  const acct = ws.account && accounts.get(ws.account.user);
+  if (!acct || !acct.isAdmin) return sendError(ws, 'Admin access required.');
+
+  const deny = (message) => send(ws, { type: 'admin_error', message });
+  const done = (notice) => sendAdminList(ws, notice);
+  const target = (msg.username || '').trim().toLowerCase();
+  const tAcct = target ? accounts.get(target) : null;
+
+  switch (msg.type) {
+    case 'admin_list_users':
+      return sendAdminList(ws);
+
+    case 'admin_create_user': {
+      const err = validateCredentials(msg.username, msg.password);
+      if (err) return deny(err);
+      const key = String(msg.username).trim().toLowerCase();
+      if (accounts.has(key)) return deny('That username is already taken.');
+      accounts.set(key, {
+        username: String(msg.username).trim(),
+        hash: hashPassword(String(msg.password)),
+        isAdmin: false,
+        balance: 0, // new accounts start with 0; the admin loads chips
+        createdAt: Date.now(),
+        disabled: false,
+      });
+      persistAccounts();
+      return done(`Created account "${msg.username.trim()}".`);
+    }
+
+    case 'admin_reset_password': {
+      if (!tAcct) return deny('User not found.');
+      if (typeof msg.newPassword !== 'string' || msg.newPassword.length < 4) {
+        return deny('New password must be at least 4 characters.');
+      }
+      tAcct.hash = hashPassword(msg.newPassword);
+      persistAccounts();
+      return done(`Password reset for "${tAcct.username}".`);
+    }
+
+    case 'admin_add_chips': {
+      if (!tAcct) return deny('User not found.');
+      const amount = msg.amount;
+      if (!Number.isInteger(amount) || amount <= 0 || amount > MAX_CHIPS) {
+        return deny('Amount must be a positive whole number.');
+      }
+      tAcct.balance = Math.min(MAX_CHIPS, tAcct.balance + amount);
+      persistAccounts();
+      applyBalanceToRooms(target); // live-update their seat if they're in a room
+      return done(`Added ${amount} chips to "${tAcct.username}" (now ${tAcct.balance}).`);
+    }
+
+    case 'admin_set_balance': {
+      if (!tAcct) return deny('User not found.');
+      const amount = msg.amount;
+      if (!Number.isInteger(amount) || amount < 0 || amount > MAX_CHIPS) {
+        return deny('Balance must be a whole number between 0 and ' + MAX_CHIPS + '.');
+      }
+      tAcct.balance = amount;
+      persistAccounts();
+      applyBalanceToRooms(target);
+      return done(`Set "${tAcct.username}" balance to ${amount}.`);
+    }
+
+    case 'admin_set_disabled': {
+      if (!tAcct) return deny('User not found.');
+      if (target === ws.account.user) return deny('You cannot disable your own account.');
+      tAcct.disabled = !!msg.disabled;
+      persistAccounts();
+      if (tAcct.disabled) kickAccountEverywhere(target, 'account disabled');
+      return done(`"${tAcct.username}" ${tAcct.disabled ? 'disabled' : 're-enabled'}.`);
+    }
+
+    case 'admin_delete_user': {
+      if (!tAcct) return deny('User not found.');
+      if (target === ws.account.user) return deny('You cannot delete your own account.');
+      kickAccountEverywhere(target, 'account deleted');
+      accounts.delete(target);
+      persistAccounts();
+      return done(`Deleted account "${tAcct.username}".`);
+    }
+
+    default:
+      return sendError(ws, 'Unknown admin action.');
+  }
+}
+
+// Never includes password hashes.
+function sendAdminList(ws, notice) {
+  const users = [...accounts.values()]
+    .map(publicUser)
+    .sort((a, b) => a.username.localeCompare(b.username));
+  send(ws, { type: 'admin_users', users, notice: notice || null });
+}
+
 /* --------------------------- tick & timeouts ------------------------- */
 function tick() {
   const now = Date.now();
+  // Drop expired login sessions.
+  for (const [t, s] of sessions) {
+    if (s.expiresAt <= now) sessions.delete(t);
+  }
   for (const room of [...rooms.values()]) {
     const r = room.round;
     if (room.phase === 'playing' && r) {
@@ -759,6 +1105,19 @@ function tick() {
 function handleMessage(ws, raw) {
   let msg;
   try { msg = JSON.parse(raw); } catch (e) { return; }
+
+  // Auth first: these work without (and before) a login.
+  switch (msg.type) {
+    case 'login': return onLogin(ws, msg);
+    case 'auth':  return onAuthToken(ws, msg);
+    case 'logout': return onLogout(ws);
+    default: break;
+  }
+  if (!ws.account) return sendError(ws, 'Please log in to continue.');
+
+  // Admin backend messages (each validated with an isAdmin check).
+  if (String(msg.type).startsWith('admin_')) return handleAdmin(ws, msg);
+
   const ref = ws.playerRef;
   const room = ref ? rooms.get(ref.roomCode) : null;
   const player = room ? room.players.get(ref.playerId) : null;
@@ -781,7 +1140,6 @@ function handleMessage(ws, raw) {
     case 'sideshow_response': fail(doSideshowResponse(room, player, msg.accept)); break;
     case 'show':          fail(doShow(room, player)); break;
     case 'play_again':    fail(doPlayAgain(room, player)); break;
-    case 'refill':        fail(doRefill(room, player)); break;
     case 'remove_player': fail(doRemovePlayer(room, player, msg.targetId)); break;
     case 'leave':         removePlayer(room, player.id, 'left'); break;
     default: sendError(ws, 'Unknown action.');
@@ -815,6 +1173,7 @@ function requestHandler(req, res) {
   if (req.method !== 'GET') { res.writeHead(405); res.end(); return; }
   let p = decodeURIComponent(req.url.split('?')[0]);
   if (p === '/') p = '/index.html';
+  if (p === '/admin' || p === '/admin/') p = '/admin.html'; // admin backend panel
   const file = path.normalize(path.join(PUBLIC_DIR, p));
   if (!file.startsWith(PUBLIC_DIR)) { res.writeHead(403); res.end(); return; }
   fs.readFile(file, (err, data) => {
@@ -835,6 +1194,8 @@ function requestHandler(req, res) {
 /* ------------------------------ startup ------------------------------ */
 function startServer() {
   const WebSocket = require('ws'); // lazy so unit tests don't need it
+  loadAccounts();
+  bootstrapAdmin();
   const server = http.createServer(requestHandler);
   const wss = new WebSocket.Server({ server });
   wss.on('connection', (ws) => {
@@ -853,5 +1214,5 @@ if (require.main === module) startServer();
 
 module.exports = {
   evaluateHand, compareHands, cardCode, newDeck, shuffle,
-  BOOT, START_CHIPS, MAX_PLAYERS, TURN_MS,
+  BOOT, MAX_PLAYERS, TURN_MS,
 };

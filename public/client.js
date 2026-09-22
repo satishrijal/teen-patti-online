@@ -66,6 +66,7 @@ let lastTickSec = -1;
 let dismissedResult = '';
 let retryDelay = 1000;
 let intentionalClose = false;
+let auth = null; // { token, username, isAdmin } once logged in
 
 function session() {
   try { return JSON.parse(localStorage.getItem('tp_session') || 'null'); } catch (e) { return null; }
@@ -73,15 +74,23 @@ function session() {
 function saveSession(s) { localStorage.setItem('tp_session', JSON.stringify(s)); }
 function clearSession() { localStorage.removeItem('tp_session'); }
 
+// Login session token (7-day expiry server-side).
+function authToken() { try { return localStorage.getItem('tp_auth') || null; } catch (e) { return null; } }
+function saveAuthToken(t) { try { localStorage.setItem('tp_auth', t); } catch (e) {} }
+function clearAuth() { try { localStorage.removeItem('tp_auth'); } catch (e) {} auth = null; }
+
 function connect() {
+  if (ws && ws.readyState !== 3) return; // already open or connecting
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   ws = new WebSocket(`${proto}://${location.host}`);
   ws.onopen = () => {
     retryDelay = 1000;
-    const s = session();
-    if (s && s.token && s.code) {
-      // Auto-rejoin after a dropped connection / refresh.
-      send({ type: 'join_room', code: s.code, name: s.name, token: s.token });
+    const t = authToken();
+    if (t) {
+      // Resume the login session first; room rejoin happens after auth_ok.
+      send({ type: 'auth', token: t });
+    } else {
+      showScreen('login');
     }
   };
   ws.onmessage = (ev) => {
@@ -112,6 +121,18 @@ function route(msg) {
     }
     detectEvents();
     render();
+  } else if (msg.type === 'auth_ok') {
+    onAuthOk(msg);
+  } else if (msg.type === 'auth_fail') {
+    clearAuth();
+    showScreen('login');
+    loginError(msg.message);
+  } else if (msg.type === 'logged_out') {
+    clearAuth();
+    clearSession();
+    state = null; prevState = null;
+    showScreen('login');
+    toast('Logged out.');
   } else if (msg.type === 'sideshow_request') {
     AudioFX.turn();
     openSideshowModal(msg);
@@ -123,6 +144,42 @@ function route(msg) {
     toast('You were removed from the room.', true);
     showScreen('home');
     refreshRejoin();
+  }
+}
+
+// Run fn as soon as the socket is open (connecting first if needed).
+function whenOpen(fn) {
+  if (ws && ws.readyState === 1) return fn();
+  connect();
+  const iv = setInterval(() => {
+    if (ws && ws.readyState === 1) { clearInterval(iv); fn(); }
+  }, 100);
+  setTimeout(() => clearInterval(iv), 8000);
+}
+
+function loginError(text) {
+  const e = $('#login-error');
+  if (!e) return;
+  e.textContent = text; e.hidden = false;
+}
+
+function onAuthOk(msg) {
+  auth = { token: msg.token, username: msg.username, isAdmin: !!msg.isAdmin };
+  saveAuthToken(msg.token);
+  const badge = $('#auth-user');
+  badge.textContent = '👤 ' + msg.username;
+  badge.hidden = false;
+  $('#btn-logout').hidden = false;
+  $('#home-username').textContent = msg.username;
+  $('#home-balance').textContent = msg.balance;
+  const le = $('#login-error');
+  if (le) le.hidden = true;
+  showScreen('home');
+  refreshRejoin();
+  // Auto-rejoin the previous room after a dropped connection / refresh.
+  const s = session();
+  if (s && s.token && s.code) {
+    send({ type: 'join_room', code: s.code, token: s.token });
   }
 }
 
@@ -159,8 +216,8 @@ function detectEvents() {
 
 /* --------------------------------- UI ------------------------------- */
 function showScreen(name) {
-  for (const s of ['home', 'lobby', 'table']) $('#screen-' + s).hidden = s !== name;
-  $('#btn-leave').hidden = name === 'home';
+  for (const s of ['login', 'home', 'lobby', 'table']) $('#screen-' + s).hidden = s !== name;
+  $('#btn-leave').hidden = (name === 'home' || name === 'login');
 }
 function toast(text, isErr = false) {
   const t = document.createElement('div');
@@ -180,6 +237,20 @@ function openModal(html) {
 }
 function closeModal() { $('#modal-root').innerHTML = ''; }
 
+/* ------------------------------ login ------------------------------- */
+function initLogin() {
+  const attempt = () => {
+    const username = $('#in-login-user').value.trim();
+    const password = $('#in-login-pass').value;
+    if (!username || !password) return loginError('Enter your username and password.');
+    AudioFX.ensure(); AudioFX.click();
+    whenOpen(() => send({ type: 'login', username, password }));
+  };
+  $('#btn-login').addEventListener('click', attempt);
+  $('#in-login-user').addEventListener('keydown', e => { if (e.key === 'Enter') $('#in-login-pass').focus(); });
+  $('#in-login-pass').addEventListener('keydown', e => { if (e.key === 'Enter') attempt(); });
+}
+
 /* ------------------------------ home -------------------------------- */
 function refreshRejoin() {
   const s = session();
@@ -198,36 +269,27 @@ function initHome() {
     $('#tab-join').hidden = t.dataset.tab !== 'join';
   }));
   const doCreate = () => {
-    const name = $('#in-create-name').value.trim();
-    if (!name) return homeError('Enter your name first.');
+    if (!auth) return homeError('Please log in first.');
     AudioFX.ensure(); AudioFX.click();
-    connect(); // fresh socket for a clean join
-    const iv = setInterval(() => {
-      if (ws && ws.readyState === 1) { clearInterval(iv); send({ type: 'create_room', name }); }
-    }, 100);
+    whenOpen(() => send({ type: 'create_room' }));
   };
-  const doJoin = (code, name, token) => {
+  const doJoin = (code, token) => {
+    if (!auth) return homeError('Please log in first.');
     AudioFX.ensure(); AudioFX.click();
-    connect();
-    const iv = setInterval(() => {
-      if (ws && ws.readyState === 1) { clearInterval(iv); send({ type: 'join_room', code, name, token }); }
-    }, 100);
+    whenOpen(() => send({ type: 'join_room', code, token }));
   };
   $('#btn-create').addEventListener('click', doCreate);
   $('#btn-join').addEventListener('click', () => {
     const code = $('#in-join-code').value.trim().toUpperCase();
-    const name = $('#in-join-name').value.trim();
     if (code.length !== 6) return homeError('Room code is 6 characters.');
-    if (!name) return homeError('Enter your name first.');
-    doJoin(code, name);
+    doJoin(code);
   });
   $('#btn-rejoin').addEventListener('click', () => {
     const s = session();
-    if (s) doJoin(s.code, s.name, s.token);
+    if (s) doJoin(s.code, s.token);
   });
   $('#btn-forget').addEventListener('click', () => { clearSession(); refreshRejoin(); });
-  $('#in-create-name').addEventListener('keydown', e => { if (e.key === 'Enter') doCreate(); });
-  $('#in-join-name').addEventListener('keydown', e => { if (e.key === 'Enter') $('#btn-join').click(); });
+  $('#in-join-code').addEventListener('keydown', e => { if (e.key === 'Enter') $('#btn-join').click(); });
 }
 function homeError(text) {
   const e = $('#home-error');
@@ -277,13 +339,13 @@ function renderLobby() {
   const readyCount = state.players.filter(p => p.ready && p.connected && p.balance >= state.room.boot).length;
   startBtn.disabled = readyCount < 2;
   $('#lobby-hint').textContent = broke
-    ? 'You are out of chips — hit Refill to keep playing.'
+    ? 'You are out of chips — ask the admin to load chips for you.'
     : readyCount < 2
       ? `Waiting for players… ${readyCount} ready (need 2+).`
       : me.isHost ? `${readyCount} ready — start when everyone is set!` : 'Waiting for the host to start…';
 
-  const refill = $('#btn-refill');
-  refill.hidden = !broke;
+  const hb = $('#home-balance');
+  if (hb) hb.textContent = me.balance;
 
   // Result modal after a round.
   const res = state.room.result;
@@ -587,6 +649,7 @@ function render() {
 
 /* --------------------------------- init ------------------------------ */
 function init() {
+  initLogin();
   initHome();
   refreshRejoin();
 
@@ -605,14 +668,27 @@ function init() {
     try { ws && ws.close(); } catch (e) {}
     clearSession();
     state = null; prevState = null;
-    setTimeout(() => { intentionalClose = false; }, 500);
+    setTimeout(() => { intentionalClose = false; connect(); }, 500);
     showScreen('home');
     refreshRejoin();
   });
 
+  $('#btn-logout').addEventListener('click', () => {
+    if (!confirm('Log out?')) return;
+    intentionalClose = true;
+    try { send({ type: 'logout' }); } catch (e) {}
+    try { ws && ws.close(); } catch (e) {}
+    clearAuth();
+    clearSession();
+    state = null; prevState = null;
+    $('#auth-user').hidden = true;
+    $('#btn-logout').hidden = true;
+    setTimeout(() => { intentionalClose = false; }, 500);
+    showScreen('login');
+  });
+
   $('#btn-ready').addEventListener('click', () => { AudioFX.click(); send({ type: 'toggle_ready' }); });
   $('#btn-start').addEventListener('click', () => { AudioFX.click(); send({ type: 'start_game' }); });
-  $('#btn-refill').addEventListener('click', () => { AudioFX.click(); send({ type: 'refill' }); });
   $('#btn-copy-code').addEventListener('click', () => {
     const code = $('#lobby-code').textContent;
     const done = () => toast('Room code copied!');
@@ -625,7 +701,7 @@ function init() {
   });
 
   connect();
-  showScreen('home');
+  showScreen('login');
 }
 
 document.addEventListener('DOMContentLoaded', init);
