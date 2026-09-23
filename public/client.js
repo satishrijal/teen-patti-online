@@ -40,6 +40,67 @@ const AudioFX = {
 };
 document.addEventListener('pointerdown', () => AudioFX.ensure(), { passive: true });
 
+/* --------------------------- background music -------------------------- */
+/* Optional looping music. Drop an MP3 at public/music/background.mp3 and it
+ * plays (volume 0.3, looped) once the user first taps/clicks anywhere —
+ * browsers block audio before a user gesture. No file = no music, no
+ * errors: the Audio element's error event simply marks it unavailable and
+ * hides the toggle button. Music mute is independent of the SFX mute. */
+const Music = {
+  el: null,
+  available: true, // flipped to false if background.mp3 fails to load
+  started: false,
+  get muted() { return localStorage.getItem('tp_music_muted') === '1'; },
+  set muted(v) { localStorage.setItem('tp_music_muted', v ? '1' : '0'); },
+  ensureEl() {
+    if (this.el || !this.available) return this.el;
+    try {
+      const a = new Audio();
+      a.preload = 'none'; // don't fetch anything until the user gestures
+      a.loop = true;
+      a.volume = 0.3; // sit behind the game sounds
+      a.addEventListener('error', () => {
+        this.available = false;
+        this.el = null;
+        this.setMutedUI(); // hides the toggle button
+      });
+      a.src = 'music/background.mp3';
+      this.el = a;
+    } catch (e) { this.available = false; }
+    return this.el;
+  },
+  start() {
+    // Called on the first user gesture (and on unmute). Browsers allow
+    // audio.play() inside a gesture handler.
+    if (this.started || this.muted || !this.available) return;
+    const a = this.ensureEl();
+    if (!a) return;
+    this.started = true;
+    try {
+      const p = a.play();
+      if (p && p.catch) p.catch(() => { this.started = false; });
+    } catch (e) { this.started = false; }
+  },
+  setMutedUI() {
+    const btn = $('#btn-music');
+    if (!btn) return;
+    if (!this.available) { btn.hidden = true; return; }
+    btn.hidden = false;
+    btn.textContent = this.muted ? '🔇' : '🎵';
+  },
+  toggle() {
+    this.muted = !this.muted;
+    if (this.muted) {
+      if (this.el) { try { this.el.pause(); } catch (e) {} }
+    } else {
+      this.started = false; // allow start() to (re)try playback
+      this.start();
+    }
+    this.setMutedUI();
+  },
+};
+document.addEventListener('pointerdown', () => Music.start(), { passive: true });
+
 /* -------------------------------- cards ----------------------------- */
 const SUIT_SYM = { S: '♠', H: '♥', D: '♦', C: '♣' };
 function cardEl(code, small = false, dealt = false, delay = 0) {
@@ -660,6 +721,13 @@ function init() {
     if (!AudioFX.muted) AudioFX.click();
   });
   if (AudioFX.muted) $('#btn-mute').textContent = '🔇';
+
+  $('#btn-music').addEventListener('click', () => {
+    AudioFX.ensure();
+    Music.toggle();
+    AudioFX.click();
+  });
+  Music.setMutedUI();
 
   $('#btn-leave').addEventListener('click', () => {
     if (!confirm('Leave this room?')) return;
