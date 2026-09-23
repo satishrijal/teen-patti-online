@@ -269,6 +269,22 @@ body {
   max-width: 110px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 
+/* ---------- voice chat ---------- */
+#btn-voice.voice-on {
+  background: #1f7a3d; border-color: var(--green); color: #fff;
+  box-shadow: 0 0 12px rgba(46,204,113,.55);
+}
+#btn-voice.voice-muted {
+  background: rgba(231,76,60,.18); border-color: var(--red); color: #ff9a8a;
+}
+.seat.speaking .avatar {
+  border-color: var(--green);
+  box-shadow: 0 0 0 3px rgba(46,204,113,.35), 0 0 22px rgba(46,204,113,.85);
+}
+.player-list li.speaking .avatar {
+  box-shadow: 0 0 0 3px rgba(46,204,113,.4), 0 0 16px rgba(46,204,113,.7);
+}
+
 /* ---------- responsive ---------- */@media (max-width: 640px) {
   #table-wrap { min-height: 380px; }
   .seat { width: 70px; }

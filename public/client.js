@@ -101,6 +101,385 @@ const Music = {
 };
 document.addEventListener('pointerdown', () => Music.start(), { passive: true });
 
+/* ------------------------------ voice chat ----------------------------- */
+/* PUBG-style open-mic voice chat, scoped to the current room. The server
+ * only relays signaling (see handleVoice in server.js); all audio is
+ * peer-to-peer WebRTC between browsers — the server never hears anything.
+ *
+ * UX: tap 🎤 once → mic goes live (green). Tap again → muted (you stay in
+ * the call, no renegotiation). Tap again → unmute. Leaving the room,
+ * logging out, or getting kicked turns voice off completely.
+ *
+ * Mesh: full mesh between voice-enabled members. To avoid offer glare,
+ * roles are deterministic: the lexicographically LARGER username offers,
+ * the SMALLER one answers. Both sides agree, so exactly one offer flies
+ * per pair, even if both tap the mic at the same instant. */
+const Voice = {
+  enabled: false,   // mic button toggled on (may still be muted)
+  muted: false,
+  stream: null,     // local MediaStream
+  pcs: new Map(),   // lowerUsername -> RTCPeerConnection
+  audioEls: new Map(), // lowerUsername -> HTMLAudioElement (remote audio)
+  analysers: new Map(), // lowerUsername -> { analyser, data, lastSpoke } ('__local__' = self)
+  audioCtx: null,
+  levelTimer: null,
+  announced: false, // voice_join sent on the current socket
+  myUser: null,     // my lowercase username, set when enabling
+
+  get supported() {
+    return !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
+  },
+
+  /* ----- button ----- */
+  updateButton() {
+    const btn = $('#btn-voice');
+    if (!btn) return;
+    const inRoom = !!(state && state.room && (state.room.phase === 'lobby' || state.room.phase === 'playing'));
+    // Hidden where voice can't work: login/home screens, or insecure contexts.
+    btn.hidden = !inRoom || !this.supported;
+    btn.classList.toggle('voice-on', this.enabled && !this.muted);
+    btn.classList.toggle('voice-muted', this.enabled && this.muted);
+    btn.title = !this.enabled ? 'Voice chat off — tap to talk'
+      : this.muted ? 'Mic muted — tap to unmute' : 'Mic live — tap to mute';
+  },
+
+  async toggle() {
+    if (!this.enabled) await this.enable();
+    else this.setMuted(!this.muted);
+  },
+
+  async enable() {
+    if (this.enabled) return;
+    if (!this.supported) { toast('Voice chat needs a secure (HTTPS) connection.'); return; }
+    if (!auth) { toast('Log in first.', true); return; }
+    AudioFX.ensure();
+    let stream;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+      });
+    } catch (e) {
+      toast('Microphone blocked — game still works.', true);
+      return;
+    }
+    this.stream = stream;
+    this.enabled = true;
+    this.muted = false;
+    this.myUser = auth.username.toLowerCase();
+    this.announced = false;
+    this.startLevels();
+    this.announce(); // sends voice_join if we're seated in a room
+    this.updateButton();
+    toast('🎤 Voice on — your squad can hear you.');
+  },
+
+  setMuted(m) {
+    if (!this.enabled || !this.stream) return;
+    this.muted = m;
+    for (const t of this.stream.getAudioTracks()) { try { t.enabled = !m; } catch (e) {} }
+    this.updateButton();
+    toast(m ? 'Mic muted' : '🎤 Mic live');
+  },
+
+  announce() {
+    // (Re)send voice_join on the current socket. The server relays it to
+    // the room and puts us in room.voiceUsers so late joiners find us.
+    if (!this.enabled || !this.stream || this.announced || !state) return;
+    if (auth) this.myUser = auth.username.toLowerCase();
+    send({ type: 'voice_join' });
+    this.announced = true;
+    this.reconcile(); // offer to anyone already on voice
+  },
+
+  // Called on every incoming room state: offer to new voice members I'm
+  // responsible for, tear down PCs for members who left voice.
+  onState() {
+    if (this.enabled && this.stream) {
+      if (!this.announced) this.announce();
+      else this.reconcile();
+    }
+    this.updateButton();
+  },
+
+  // Am I the offerer for the pair (me, peer)? Larger username offers.
+  isOfferer(peerUser) { return this.myUser > peerUser; },
+
+  reconcile() {
+    if (!this.enabled || !this.stream || !state || !state.room) return;
+    const seen = new Set();
+    for (const u of (state.room.voiceUsers || [])) {
+      const key = String(u).toLowerCase();
+      if (!key || key === this.myUser) continue;
+      seen.add(key);
+      if (!this.pcs.has(key) && this.isOfferer(key)) this.offerTo(key);
+    }
+    for (const key of [...this.pcs.keys()]) {
+      if (!seen.has(key)) this.dropPeer(key);
+    }
+  },
+
+  getOrCreatePC(peerUser) {
+    let pc = this.pcs.get(peerUser);
+    if (pc) return pc;
+    const PC = window.RTCPeerConnection || window.webkitRTCPeerConnection;
+    pc = new PC({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
+    pc._peer = peerUser;
+    pc._pendingIce = [];
+    try {
+      for (const t of this.stream.getAudioTracks()) pc.addTrack(t, this.stream);
+    } catch (e) { /* very old browsers */ }
+    pc.onicecandidate = (ev) => {
+      if (ev.candidate) {
+        const c = ev.candidate.toJSON ? ev.candidate.toJSON() : ev.candidate;
+        send({ type: 'voice_ice', to: peerUser, candidate: c });
+      }
+    };
+    pc.ontrack = (ev) => this.onRemoteTrack(peerUser, ev);
+    pc.onconnectionstatechange = () => {
+      // Failed PCs are dropped; reconcile() re-offers if they're still on voice.
+      if (pc.connectionState === 'failed' || pc.connectionState === 'closed') this.dropPeer(peerUser);
+    };
+    this.pcs.set(peerUser, pc);
+    return pc;
+  },
+
+  async offerTo(peerUser) {
+    if (!this.enabled || !this.stream || this.pcs.has(peerUser)) return;
+    try {
+      const pc = this.getOrCreatePC(peerUser);
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      send({ type: 'voice_offer', to: peerUser, offer });
+    } catch (e) {
+      this.dropPeer(peerUser);
+    }
+  },
+
+  async onOffer(from, offer) {
+    if (!this.enabled || !this.stream || !offer || !from) return;
+    if (this.myUser && this.myUser > from) return; // I'm the offerer: ignore stray offers
+    try {
+      const pc = this.getOrCreatePC(from);
+      await pc.setRemoteDescription(this.sdp(offer));
+      this.flushIce(pc);
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+      send({ type: 'voice_answer', to: from, answer });
+    } catch (e) {
+      this.dropPeer(from);
+    }
+  },
+
+  async onAnswer(from, answer) {
+    const pc = this.pcs.get(from);
+    if (!pc || !answer) return;
+    try {
+      await pc.setRemoteDescription(this.sdp(answer));
+      this.flushIce(pc);
+    } catch (e) { this.dropPeer(from); }
+  },
+
+  async onIce(from, candidate) {
+    const pc = this.pcs.get(from);
+    if (!pc || !candidate) return;
+    try {
+      if (pc.remoteDescription && pc.remoteDescription.type) {
+        await pc.addIceCandidate(this.ice(candidate));
+      } else {
+        pc._pendingIce.push(candidate); // flushed once the remote description lands
+      }
+    } catch (e) { /* drop bad candidates */ }
+  },
+
+  flushIce(pc) {
+    const q = pc._pendingIce || [];
+    pc._pendingIce = [];
+    for (const c of q) {
+      try {
+        const r = pc.addIceCandidate(this.ice(c));
+        if (r && r.catch) r.catch(() => {});
+      } catch (e) {}
+    }
+  },
+
+  // Wrap plain SDP/ICE objects for older browsers that want constructors.
+  sdp(o) {
+    try {
+      const C = window.RTCSessionDescription || window.webkitRTCSessionDescription;
+      return C ? new C(o) : o;
+    } catch (e) { return o; }
+  },
+  ice(c) {
+    try {
+      const C = window.RTCIceCandidate || window.webkitRTCIceCandidate;
+      return C ? new C(c) : c;
+    } catch (e) { return c; }
+  },
+
+  onRemoteTrack(peerUser, ev) {
+    const stream = ev.streams && ev.streams[0];
+    if (!stream) return;
+    let el = this.audioEls.get(peerUser);
+    if (!el) {
+      el = document.createElement('audio');
+      el.autoplay = true;
+      el.style.display = 'none';
+      document.body.appendChild(el);
+      this.audioEls.set(peerUser, el);
+    }
+    if (el.srcObject !== stream) {
+      el.srcObject = stream;
+      this.attachAnalyser(peerUser, stream);
+    }
+    try {
+      const p = el.play();
+      if (p && p.catch) p.catch(() => {});
+    } catch (e) {}
+  },
+
+  dropPeer(peerUser) {
+    const pc = this.pcs.get(peerUser);
+    if (pc) { try { pc.close(); } catch (e) {} this.pcs.delete(peerUser); }
+    const el = this.audioEls.get(peerUser);
+    if (el) {
+      try { el.pause(); } catch (e) {}
+      try { el.srcObject = null; } catch (e) {}
+      el.remove();
+      this.audioEls.delete(peerUser);
+    }
+    this.analysers.delete(peerUser);
+    this.setSpeaking(peerUser, false);
+  },
+
+  onSignal(msg) {
+    switch (msg.type) {
+      case 'voice_join': {
+        // The offerer side of each pair reacts; the answerer just waits.
+        // state.voiceUsers (refreshed by the same event) covers the rest.
+        const u = String(msg.user || '').toLowerCase();
+        if (u && u !== this.myUser && this.enabled && this.stream &&
+            !this.pcs.has(u) && this.isOfferer(u)) this.offerTo(u);
+        break;
+      }
+      case 'voice_leave':
+      case 'voice_peer_gone': {
+        const u = String(msg.user || '').toLowerCase();
+        if (u) this.dropPeer(u);
+        break;
+      }
+      case 'voice_offer':
+        this.onOffer(String(msg.from || '').toLowerCase(), msg.offer);
+        break;
+      case 'voice_answer':
+        this.onAnswer(String(msg.from || '').toLowerCase(), msg.answer);
+        break;
+      case 'voice_ice':
+        this.onIce(String(msg.from || '').toLowerCase(), msg.candidate);
+        break;
+    }
+  },
+
+  /* ----- full shutdown vs socket hiccup ----- */
+  // Full shutdown: mic off, everything torn down.
+  leave() {
+    if (this.enabled && this.announced) { try { send({ type: 'voice_leave' }); } catch (e) {} }
+    for (const key of [...this.pcs.keys()]) this.dropPeer(key);
+    if (this.stream) {
+      for (const t of this.stream.getTracks()) { try { t.stop(); } catch (e) {} }
+      this.stream = null;
+    }
+    this.analysers.clear();
+    if (this.audioCtx) { try { this.audioCtx.close(); } catch (e) {} this.audioCtx = null; }
+    this.enabled = false;
+    this.muted = false;
+    this.announced = false;
+    this.myUser = null;
+    this.stopLevels();
+    this.setSpeakingAll(false);
+    this.updateButton();
+  },
+
+  // Socket died (auto-reconnect may follow): drop peer connections but keep
+  // the mic + enabled state so voice rejoins on the fresh socket.
+  onSocketClose() {
+    for (const key of [...this.pcs.keys()]) this.dropPeer(key);
+    this.analysers.clear();
+    if (this.stream) this.attachAnalyser('__local__', this.stream);
+    this.announced = false;
+    this.setSpeakingAll(false);
+    this.updateButton();
+  },
+
+  /* ----- speaking indicators ----- */
+  ensureAudioCtx() {
+    if (!this.audioCtx) {
+      try { this.audioCtx = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) { this.audioCtx = null; }
+    }
+    if (this.audioCtx && this.audioCtx.state === 'suspended') this.audioCtx.resume();
+    return this.audioCtx;
+  },
+
+  attachAnalyser(key, stream) {
+    const ctx = this.ensureAudioCtx();
+    if (!ctx || !ctx.createAnalyser) return;
+    try {
+      const src = ctx.createMediaStreamSource(stream);
+      const an = ctx.createAnalyser();
+      an.fftSize = 512;
+      src.connect(an); // analyser only — never to destination, so no local echo
+      this.analysers.set(key, { analyser: an, data: new Uint8Array(an.frequencyBinCount), lastSpoke: 0 });
+    } catch (e) { /* no speaking glow, voice still works */ }
+  },
+
+  startLevels() {
+    this.stopLevels();
+    if (this.stream) this.attachAnalyser('__local__', this.stream);
+    this.levelTimer = setInterval(() => this.pollLevels(), 200);
+  },
+  stopLevels() {
+    if (this.levelTimer) { clearInterval(this.levelTimer); this.levelTimer = null; }
+  },
+
+  levelOf(a) {
+    // Average absolute deviation from digital silence (128) in the time domain.
+    const d = a.data;
+    a.analyser.getByteTimeDomainData(d);
+    let sum = 0;
+    for (let i = 0; i < d.length; i += 2) sum += Math.abs(d[i] - 128);
+    return sum / (d.length / 2);
+  },
+
+  pollLevels() {
+    if (!this.enabled) return;
+    const now = Date.now();
+    for (const [key, a] of this.analysers) {
+      let lvl = 0;
+      try { lvl = this.levelOf(a); } catch (e) {}
+      const speaking = lvl > 7;
+      if (speaking) a.lastSpoke = now;
+      // Small hangover so the glow doesn't flicker between syllables.
+      this.setSpeaking(key, speaking || (now - (a.lastSpoke || 0) < 400));
+    }
+  },
+
+  setSpeaking(key, on) {
+    const user = key === '__local__' ? this.myUser : key;
+    if (!user || !state) return;
+    const p = state.players.find(x => x.name.toLowerCase() === user);
+    if (!p) return;
+    const seat = document.querySelector(`.seat[data-pid="${p.id}"]`);
+    if (seat) seat.classList.toggle('speaking', !!on);
+    const li = document.querySelector(`#lobby-players li[data-pid="${p.id}"]`);
+    if (li) li.classList.toggle('speaking', !!on);
+  },
+
+  setSpeakingAll(on) {
+    document.querySelectorAll('.seat.speaking, #lobby-players li.speaking').forEach(el => {
+      el.classList.toggle('speaking', !!on);
+    });
+  },
+};
+
 /* -------------------------------- cards ----------------------------- */
 const SUIT_SYM = { S: '♠', H: '♥', D: '♦', C: '♣' };
 function cardEl(code, small = false, dealt = false, delay = 0) {
@@ -160,6 +539,7 @@ function connect() {
     route(msg);
   };
   ws.onclose = () => {
+    Voice.onSocketClose(); // drop dead peer connections; mic stays warm for rejoin
     if (intentionalClose) return;
     toast('Connection lost — retrying…');
     setTimeout(() => {
@@ -182,6 +562,7 @@ function route(msg) {
     }
     detectEvents();
     render();
+    Voice.onState();
   } else if (msg.type === 'auth_ok') {
     onAuthOk(msg);
   } else if (msg.type === 'auth_fail') {
@@ -191,6 +572,7 @@ function route(msg) {
   } else if (msg.type === 'logged_out') {
     clearAuth();
     clearSession();
+    Voice.leave();
     state = null; prevState = null;
     showScreen('login');
     toast('Logged out.');
@@ -202,9 +584,14 @@ function route(msg) {
     AudioFX.lose();
   } else if (msg.type === 'kicked') {
     clearSession();
+    Voice.leave();
     toast('You were removed from the room.', true);
     showScreen('home');
     refreshRejoin();
+  } else if (msg.type === 'voice_join' || msg.type === 'voice_leave' ||
+             msg.type === 'voice_offer' || msg.type === 'voice_answer' ||
+             msg.type === 'voice_ice' || msg.type === 'voice_peer_gone') {
+    Voice.onSignal(msg);
   }
 }
 
@@ -279,6 +666,7 @@ function detectEvents() {
 function showScreen(name) {
   for (const s of ['login', 'home', 'lobby', 'table']) $('#screen-' + s).hidden = s !== name;
   $('#btn-leave').hidden = (name === 'home' || name === 'login');
+  Voice.updateButton(); // mic button only lives on the lobby/table screens
 }
 function toast(text, isErr = false) {
   const t = document.createElement('div');
@@ -371,6 +759,7 @@ function renderLobby() {
   ul.innerHTML = '';
   for (const p of state.players) {
     const li = document.createElement('li');
+    li.dataset.pid = p.id;
     if (!p.connected) li.classList.add('offline');
     li.innerHTML = `
       <div class="avatar" style="background:${p.color}">${escapeHtml(p.name[0] || '?').toUpperCase()}</div>
@@ -729,10 +1118,19 @@ function init() {
   });
   Music.setMutedUI();
 
+  const vb = $('#btn-voice');
+  if (vb) vb.addEventListener('click', () => {
+    AudioFX.ensure();
+    AudioFX.click();
+    Voice.toggle();
+  });
+  Voice.updateButton();
+
   $('#btn-leave').addEventListener('click', () => {
     if (!confirm('Leave this room?')) return;
     intentionalClose = true;
     try { send({ type: 'leave' }); } catch (e) {}
+    Voice.leave(); // mic off, peer connections torn down
     try { ws && ws.close(); } catch (e) {}
     clearSession();
     state = null; prevState = null;
@@ -745,6 +1143,7 @@ function init() {
     if (!confirm('Log out?')) return;
     intentionalClose = true;
     try { send({ type: 'logout' }); } catch (e) {}
+    Voice.leave(); // mic off, peer connections torn down
     try { ws && ws.close(); } catch (e) {}
     clearAuth();
     clearSession();
