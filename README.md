@@ -185,6 +185,30 @@ with the music included.
 > ⚠️ Only use music you have the rights to — e.g. a song you own or
 > royalty-free music. Don't upload copyrighted tracks you don't own.
 
+## Voice chat 🎤
+
+Talk to your squad live while you play — PUBG-style open mic, no
+push-to-talk needed.
+
+- Tap the **🎤** button (top bar, appears once you're in a room) → your
+  browser asks for mic permission → your mic goes live and the button
+  turns green. Everyone else in the room with voice on hears you.
+- Tap again → **muted** (you stay in the call). Tap again → live again.
+- Leaving the room, logging out, or losing connection turns voice off.
+- Whoever is speaking gets a **green glow** around their seat/avatar.
+- 🎧 **Headphones strongly recommended** — phone/laptop speakers + open
+  mic = echo for everyone.
+
+How it works: voice is peer-to-peer WebRTC audio between browsers. The
+server only passes along connection setup messages — it never hears any
+audio. Needs a secure connection (your Render `https://` URL works;
+plain `http://` on a phone may hide the mic button entirely).
+
+> ⚠️ Honest limitation: there's no TURN relay server (those cost money),
+> so on very restrictive networks (some offices, symmetric-NAT mobile
+> carriers) two players may fail to connect voice to each other. The card
+> game itself is unaffected — voice just won't come through for that pair.
+
 ## Project layout
 
 ```

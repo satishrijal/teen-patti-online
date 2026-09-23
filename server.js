@@ -269,6 +269,7 @@ function newRoom(code) {
     dealerId: null,     // rotates each round
     lastResult: null,   // shown after a round ends until next Play Again
     feed: [],           // betting activity, newest last
+    voice: new Set(),   // lower(usernames) with voice chat on (signaling only)
   };
 }
 
@@ -361,6 +362,7 @@ function sendState(room) {
           expiresAt: r.sideshow.expiresAt,
         } : null,
         result: room.lastResult,
+        voiceUsers: [...room.voice], // lower(usernames) with voice chat on
       },
       players: room.order
         .map(id => room.players.get(id))
@@ -418,6 +420,8 @@ function removePlayer(room, playerId, reason) {
   room.players.delete(playerId);
   tokenIndex.delete(p.token);
   room.order = room.order.filter(id => id !== playerId);
+  // Voice: tell the squad to tear down peer connections to the leaver.
+  broadcastVoiceGone(room, p.accountName, null);
 
   if (r) {
     const idx = r.turnOrder.indexOf(playerId);
@@ -1064,6 +1068,69 @@ function sendAdminList(ws, notice) {
   send(ws, { type: 'admin_users', users, notice: notice || null });
 }
 
+/* ----------------------------- voice chat ---------------------------- */
+// Live voice chat is pure WebRTC between browsers — the server NEVER sees
+// audio. It only relays signaling messages between players in the SAME
+// room, addressed by lowercase username. Anything cross-room (or from a
+// socket that isn't seated in a room) is silently dropped.
+function voiceRoomOf(ws) {
+  const ref = ws.playerRef;
+  const room = ref ? rooms.get(ref.roomCode) : null;
+  if (!room) return null;
+  const me = room.players.get(ref.playerId);
+  if (!me || !me.accountName) return null;
+  return { room, me };
+}
+
+function broadcastVoice(room, obj, exceptId) {
+  for (const p of room.players.values()) {
+    if (p.id !== exceptId && p.ws && p.ws.readyState === 1) send(p, obj);
+  }
+}
+
+function handleVoice(ws, msg) {
+  const v = voiceRoomOf(ws);
+  if (!v) return; // sender in no room: silently drop
+  const { room, me } = v;
+  const senderKey = me.accountName; // lowercase username
+
+  if (msg.type === 'voice_join' || msg.type === 'voice_leave') {
+    if (msg.type === 'voice_join') room.voice.add(senderKey);
+    else room.voice.delete(senderKey);
+    broadcastVoice(room, { type: msg.type, user: senderKey, name: me.name }, me.id);
+    sendState(room); // refreshes room.voiceUsers for everyone, incl. joiner
+    return;
+  }
+
+  // Directed signaling: voice_offer / voice_answer / voice_ice.
+  const toKey = String(msg.to || '').toLowerCase();
+  if (!toKey || toKey === senderKey) return;
+  const target = [...room.players.values()].find(
+    p => p.accountName === toKey && p.ws && p.ws.readyState === 1
+  );
+  if (!target) return; // cross-room, unknown, or offline: silently drop
+  const out = { type: msg.type, from: senderKey, name: me.name };
+  if (msg.type === 'voice_offer') {
+    if (!msg.offer || typeof msg.offer !== 'object') return;
+    out.offer = msg.offer;
+  } else if (msg.type === 'voice_answer') {
+    if (!msg.answer || typeof msg.answer !== 'object') return;
+    out.answer = msg.answer;
+  } else if (msg.type === 'voice_ice') {
+    if (!msg.candidate || typeof msg.candidate !== 'object') return;
+    out.candidate = msg.candidate;
+  } else return;
+  send(target, out);
+}
+
+// Tell the squad to tear down voice peer connections to someone who left.
+function broadcastVoiceGone(room, accountName, exceptId) {
+  if (!accountName) return;
+  if (room.voice.delete(accountName)) {
+    broadcastVoice(room, { type: 'voice_peer_gone', user: accountName }, exceptId);
+  }
+}
+
 /* --------------------------- tick & timeouts ------------------------- */
 function tick() {
   const now = Date.now();
@@ -1121,6 +1188,9 @@ function handleMessage(ws, raw) {
     case 'join_room':   return onJoinRoom(ws, msg);
     default: break;
   }
+  // Voice signaling: relayed only between members of the same room, and
+  // silently dropped when the sender isn't seated in one.
+  if (String(msg.type).indexOf('voice_') === 0) return handleVoice(ws, msg);
   if (!room || !player) return sendError(ws, 'Join a room first.');
 
   const fail = (problem) => { if (problem) sendError(ws, problem); };
@@ -1150,6 +1220,8 @@ function onDisconnect(ws) {
   p.connected = false;
   p.ws = null;
   p.disconnectedAt = Date.now();
+  // Voice: peers tear down their connections now; a reconnect re-joins voice.
+  broadcastVoiceGone(room, p.accountName, p.id);
   feed(room, `${p.name} disconnected (seat held for 2 min).`);
   if (p.isHost) migrateHost(room);
   if (room.players.size === 0) { rooms.delete(room.code); return; }
