@@ -125,8 +125,37 @@ log in as another player, and join with the code.
 > **Free-tier notes:** Render spins free services down after inactivity, so the
 > first visit after a while can take ~30–60 seconds to wake up. Rooms live in
 > server memory, so a restart clears active rooms (players just create a new one).
-> Accounts live in `data/` on disk, which is also wiped on restart/redeploy —
-> see the warning above.
+> Accounts live in PostgreSQL (Neon) when `DATABASE_URL` is set — see below —
+> so logins and chip balances survive restarts and redeploys forever. Without
+> `DATABASE_URL`, accounts use the local `data/accounts.json` file, which IS
+> wiped on restart/redeploy.
+
+## Persistent accounts with Neon (free, no expiry) — recommended
+
+Without this step, Render wipes the account file on every restart/redeploy
+(and logins + chip balances vanish — the exact problem this fixes). Neon is
+a hosted PostgreSQL with a free tier that doesn't expire:
+
+1. **Create a free Neon account** — go to [neon.tech](https://neon.tech),
+   sign up, and create a new project (any name, e.g. `teen-patti`). It creates
+   a database for you automatically.
+2. **Copy the connection string** — on the Neon dashboard, find the
+   **Connection String** (use the *pooled* one if offered) and copy it. It
+   looks like `postgres://user:password@...neon.tech/dbname?sslmode=require`.
+3. **Add it to Render** — Dashboard → your web service → **Environment** →
+   **Add Environment Variable**: key `DATABASE_URL`, value = the string you
+   copied → **Save Changes**. Render redeploys automatically.
+4. **Done** — on first boot the server creates its tables automatically. If
+   your old `data/accounts.json` still exists with accounts in it, they're
+   imported once automatically, so nobody needs to be recreated.
+
+> 🔒 Never paste your connection string into chat or commit it to GitHub —
+> it goes only into Render's Environment settings (and your own `.env`
+> locally if you test with a database).
+
+To use Postgres in local dev too, create a `.env`-style export before
+starting: `DATABASE_URL="postgres://..." npm start`. Without it, the game
+uses the local JSON file — perfect for testing.
 
 ## Game night flow
 
@@ -139,18 +168,38 @@ log in as another player, and join with the code.
 5. Someone goes bust mid-night? Load them more chips from `/admin` — their
    balance updates live, even while they're sitting in the lobby.
 
+## Background music
+
+Want some vibe while you play? Drop an MP3 into `public/music/` named exactly
+`background.mp3` and the game will loop it at low volume once the player first
+taps anywhere (browsers block audio before a user gesture).
+
+- A 🎵 button in the top bar mutes/unmutes the music; the choice is remembered.
+- It's independent from the 🔊 sound-effects toggle.
+- No file = no music, and everything works exactly the same.
+
+On Render: add the MP3 to the `public/music/` folder in your GitHub repo
+(same drag-and-drop upload as the other files), commit, and Render redeploys
+with the music included.
+
+> ⚠️ Only use music you have the rights to — e.g. a song you own or
+> royalty-free music. Don't upload copyrighted tracks you don't own.
+
 ## Project layout
 
 ```
 server.js          # game server: accounts/auth, admin backend, rooms, betting
                    # engine, hand evaluator, WebSocket protocol
-package.json       # deps (ws), start script, Node engine
+store.js           # account storage: PostgreSQL (Neon) when DATABASE_URL is
+                   # set, otherwise the local data/accounts.json file
+package.json       # deps (ws, pg), start script, Node engine
 data/              # auto-created: accounts.json (never commit real data)
 public/
   index.html       # single-page app shell (login -> home -> lobby -> table)
   style.css        # felt-table theme, cards, animations, mobile layout
   client.js        # UI, seat layout, sounds (WebAudio), countdown, modals
   admin.html       # admin backend panel (served at /admin)
+  music/           # optional: drop background.mp3 here for looping music
 ```
 
 ## WebSocket protocol (for the curious)

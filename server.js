@@ -36,8 +36,8 @@ const PUBLIC_DIR = path.join(__dirname, 'public');
 /* --------------------------- accounts config ------------------------- */
 // Virtual-chip accounts. The admin (Satish) creates logins for friends and
 // loads chips onto them from the /admin panel. Play money only.
-const DATA_DIR = process.env.TP_DATA_DIR || path.join(__dirname, 'data');
-const ACCOUNTS_FILE = path.join(DATA_DIR, 'accounts.json');
+// Storage backend is chosen in store.js (PostgreSQL when DATABASE_URL is set,
+// otherwise the local data/ JSON file).
 const ADMIN_USER = process.env.ADMIN_USER || 'admin';
 const ADMIN_PASS = process.env.ADMIN_PASS || 'changeme123';
 const SESSION_TTL_MS = 7 * 24 * 3600 * 1000; // login sessions last 7 days
@@ -118,12 +118,18 @@ function compareHands(a, b) {
 
 /* ------------------------------ accounts ----------------------------- */
 /* Player accounts with login + admin-managed chip balances.
- * Stored in data/accounts.json, written atomically (tmp file + rename)
- * so a crash mid-write can never corrupt the file.
+ * Storage lives in store.js: PostgreSQL when DATABASE_URL is set (Neon
+ * free tier — accounts survive restarts forever), otherwise the local
+ * data/accounts.json file (zero-config local dev).
+ * `accounts` / `sessions` are the store's live in-memory caches; every
+ * mutation goes through the store's save and delete methods so the
+ * backend stays in sync.
  * Passwords are salted scrypt hashes — hashes never leave the server.  */
-const accounts = new Map();   // lower(username) -> account
-const sessions = new Map();    // session token -> { user, expiresAt }
-const loginFails = new Map();  // lower(username) -> { count, lockedUntil }
+const { createStore } = require('./store');
+const store = createStore();
+const accounts = store.accounts;   // lower(username) -> account
+const sessions = store.sessions;   // session token -> { user, expiresAt }
+const loginFails = new Map();      // lower(username) -> { count, lockedUntil } (in-memory)
 
 function hashPassword(password) {
   const salt = crypto.randomBytes(16);
@@ -143,36 +149,16 @@ function verifyPassword(password, stored) {
 }
 
 function loadAccounts() {
-  accounts.clear();
-  try {
-    const raw = fs.readFileSync(ACCOUNTS_FILE, 'utf8');
-    const list = JSON.parse(raw);
-    if (Array.isArray(list)) {
-      for (const a of list) {
-        if (a && typeof a.username === 'string' && typeof a.hash === 'string') {
-          accounts.set(a.username.toLowerCase(), {
-            username: a.username,
-            hash: a.hash,
-            isAdmin: !!a.isAdmin,
-            balance: Math.max(0, Math.floor(a.balance) || 0),
-            createdAt: a.createdAt || Date.now(),
-            disabled: !!a.disabled,
-          });
-        }
-      }
-    }
-  } catch (e) {
-    if (e.code !== 'ENOENT') console.error('Could not load accounts:', e.message);
-    // Missing file = first run; it will be created on first save.
-  }
+  // Historical name kept for compatibility; the store now loads the caches
+  // during store.init() in startServer(). Left as a no-op shim.
 }
 
-// Atomic write: write to a temp file, then rename over the real one.
+// Flush account durability through the store. JSON backend: rewrites the
+// whole file atomically. Postgres backend: every change was already written
+// through at its mutation site, so this is a no-op there. Kept as the single
+// choke point so the rest of the code doesn't care which backend is active.
 function persistAccounts() {
-  fs.mkdirSync(DATA_DIR, { recursive: true });
-  const tmp = ACCOUNTS_FILE + '.tmp-' + process.pid;
-  fs.writeFileSync(tmp, JSON.stringify([...accounts.values()], null, 2));
-  fs.renameSync(tmp, ACCOUNTS_FILE);
+  store.persist();
 }
 
 // Public view of an account — the password hash is NEVER included.
@@ -200,7 +186,7 @@ function validateCredentials(username, password) {
 function bootstrapAdmin() {
   const key = ADMIN_USER.toLowerCase();
   if (!accounts.has(key)) {
-    accounts.set(key, {
+    store.saveAccount({
       username: ADMIN_USER,
       hash: hashPassword(ADMIN_PASS),
       isAdmin: true,
@@ -237,16 +223,20 @@ function applyBalanceToRooms(userKey) {
   for (const room of touched) sendState(room);
 }
 
-// Copy an in-room player's balance back onto their account (no disk write).
+// Copy an in-room player's balance back onto their account (write-through
+// to the active backend so the Postgres row stays in sync).
 function syncBalanceToAccount(p) {
   if (!p || !p.accountName) return;
   const acct = accounts.get(p.accountName);
-  if (acct) acct.balance = Math.max(0, Math.floor(p.balance));
+  if (acct) {
+    acct.balance = Math.max(0, Math.floor(p.balance));
+    store.saveAccount(acct);
+  }
 }
 
 // Drop every login session + socket + room seat for an account.
 function kickAccountEverywhere(userKey, reason) {
-  for (const [t, s] of sessions) if (s.user === userKey) sessions.delete(t);
+  for (const [t, s] of sessions) if (s.user === userKey) store.deleteSession(t);
   for (const room of [...rooms.values()]) {
     for (const p of [...room.players.values()]) {
       if (p.accountName === userKey) removePlayer(room, p.id, reason);
@@ -498,7 +488,7 @@ function onLogin(ws, msg) {
 
   loginFails.delete(key);
   const token = crypto.randomBytes(32).toString('hex');
-  sessions.set(token, { user: key, expiresAt: now + SESSION_TTL_MS });
+  store.createSession(token, { user: key, expiresAt: now + SESSION_TTL_MS });
   bindAccount(ws, acct, token);
 }
 
@@ -507,12 +497,12 @@ function onAuthToken(ws, msg) {
   const s = sessions.get(token);
   if (!s) return send(ws, { type: 'auth_fail', message: 'Session expired. Please log in again.' });
   if (s.expiresAt < Date.now()) {
-    sessions.delete(token);
+    store.deleteSession(token);
     return send(ws, { type: 'auth_fail', message: 'Session expired. Please log in again.' });
   }
   const acct = accounts.get(s.user);
   if (!acct || acct.disabled) {
-    sessions.delete(token);
+    store.deleteSession(token);
     return send(ws, { type: 'auth_fail', message: 'Account unavailable. Please log in again.' });
   }
   bindAccount(ws, acct, token);
@@ -529,7 +519,7 @@ function onLogout(ws) {
       removePlayer(room, p.id, 'logged out');
     }
   }
-  if (ws.sessionToken) sessions.delete(ws.sessionToken);
+  if (ws.sessionToken) store.deleteSession(ws.sessionToken);
   ws.account = null;
   ws.sessionToken = null;
   ws.playerRef = null;
@@ -993,7 +983,7 @@ function handleAdmin(ws, msg) {
       if (err) return deny(err);
       const key = String(msg.username).trim().toLowerCase();
       if (accounts.has(key)) return deny('That username is already taken.');
-      accounts.set(key, {
+      store.saveAccount({
         username: String(msg.username).trim(),
         hash: hashPassword(String(msg.password)),
         isAdmin: false,
@@ -1011,6 +1001,7 @@ function handleAdmin(ws, msg) {
         return deny('New password must be at least 4 characters.');
       }
       tAcct.hash = hashPassword(msg.newPassword);
+      store.saveAccount(tAcct);
       persistAccounts();
       return done(`Password reset for "${tAcct.username}".`);
     }
@@ -1022,6 +1013,7 @@ function handleAdmin(ws, msg) {
         return deny('Amount must be a positive whole number.');
       }
       tAcct.balance = Math.min(MAX_CHIPS, tAcct.balance + amount);
+      store.saveAccount(tAcct);
       persistAccounts();
       applyBalanceToRooms(target); // live-update their seat if they're in a room
       return done(`Added ${amount} chips to "${tAcct.username}" (now ${tAcct.balance}).`);
@@ -1034,6 +1026,7 @@ function handleAdmin(ws, msg) {
         return deny('Balance must be a whole number between 0 and ' + MAX_CHIPS + '.');
       }
       tAcct.balance = amount;
+      store.saveAccount(tAcct);
       persistAccounts();
       applyBalanceToRooms(target);
       return done(`Set "${tAcct.username}" balance to ${amount}.`);
@@ -1043,6 +1036,7 @@ function handleAdmin(ws, msg) {
       if (!tAcct) return deny('User not found.');
       if (target === ws.account.user) return deny('You cannot disable your own account.');
       tAcct.disabled = !!msg.disabled;
+      store.saveAccount(tAcct);
       persistAccounts();
       if (tAcct.disabled) kickAccountEverywhere(target, 'account disabled');
       return done(`"${tAcct.username}" ${tAcct.disabled ? 'disabled' : 're-enabled'}.`);
@@ -1052,7 +1046,7 @@ function handleAdmin(ws, msg) {
       if (!tAcct) return deny('User not found.');
       if (target === ws.account.user) return deny('You cannot delete your own account.');
       kickAccountEverywhere(target, 'account deleted');
-      accounts.delete(target);
+      store.deleteAccount(target);
       persistAccounts();
       return done(`Deleted account "${tAcct.username}".`);
     }
@@ -1075,7 +1069,7 @@ function tick() {
   const now = Date.now();
   // Drop expired login sessions.
   for (const [t, s] of sessions) {
-    if (s.expiresAt <= now) sessions.delete(t);
+    if (s.expiresAt <= now) store.deleteSession(t);
   }
   for (const room of [...rooms.values()]) {
     const r = room.round;
@@ -1166,7 +1160,7 @@ function onDisconnect(ws) {
 const MIME = {
   '.html': 'text/html', '.css': 'text/css', '.js': 'text/javascript',
   '.json': 'application/json', '.png': 'image/png', '.svg': 'image/svg+xml',
-  '.ico': 'image/x-icon',
+  '.ico': 'image/x-icon', '.mp3': 'audio/mpeg',
 };
 
 function requestHandler(req, res) {
@@ -1192,9 +1186,9 @@ function requestHandler(req, res) {
 }
 
 /* ------------------------------ startup ------------------------------ */
-function startServer() {
+async function startServer() {
   const WebSocket = require('ws'); // lazy so unit tests don't need it
-  loadAccounts();
+  await store.init();              // pick the storage backend, load caches, migrate
   bootstrapAdmin();
   const server = http.createServer(requestHandler);
   const wss = new WebSocket.Server({ server });
@@ -1210,9 +1204,11 @@ function startServer() {
   server.listen(PORT, () => console.log(`Teen Patti server listening on port ${PORT}`));
 }
 
-if (require.main === module) startServer();
+if (require.main === module) {
+  startServer().catch((e) => { console.error('Fatal startup error:', e.message); process.exit(1); });
+}
 
 module.exports = {
   evaluateHand, compareHands, cardCode, newDeck, shuffle,
-  BOOT, MAX_PLAYERS, TURN_MS,
+  BOOT, MAX_PLAYERS, TURN_MS, store,
 };
