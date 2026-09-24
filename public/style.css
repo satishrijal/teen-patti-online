@@ -285,6 +285,49 @@ body {
   box-shadow: 0 0 0 3px rgba(46,204,113,.4), 0 0 16px rgba(46,204,113,.7);
 }
 
+/* ---------- reactions ---------- */
+#react-tray {
+  position: fixed; z-index: 60; display: flex; gap: 4px;
+  background: rgba(10,14,20,.96); border: 1px solid #33404e; border-radius: 14px;
+  padding: 8px 10px; box-shadow: 0 8px 30px rgba(0,0,0,.55);
+}
+#react-tray[hidden] { display: none; }
+#react-tray button {
+  font-size: 1.5rem; background: none; border: none; cursor: pointer;
+  padding: 4px 6px; border-radius: 8px; line-height: 1;
+}
+#react-tray button:hover { background: rgba(255,255,255,.12); transform: scale(1.2); }
+.react-float {
+  position: absolute; left: 50%; bottom: 100%; transform: translateX(-50%);
+  font-size: 2rem; pointer-events: none; z-index: 50;
+  animation: react-float 2.4s ease-out forwards;
+  filter: drop-shadow(0 2px 4px rgba(0,0,0,.6));
+}
+@keyframes react-float {
+  0% { opacity: 0; transform: translateX(-50%) translateY(10px) scale(.5); }
+  15% { opacity: 1; transform: translateX(-50%) translateY(0) scale(1.3); }
+  30% { transform: translateX(-50%) translateY(-8px) scale(1); }
+  75% { opacity: 1; }
+  100% { opacity: 0; transform: translateX(-50%) translateY(-70px) scale(.9); }
+}
+
+/* ---------- dealing ceremony ---------- */
+#deal-deck {
+  position: absolute; left: 50%; top: 46%; transform: translate(-50%,-50%);
+  z-index: 40; pointer-events: none;
+}
+#deal-deck .card.back { margin: 0; }
+#deal-deck.shuffling { animation: deck-shuffle .55s ease-in-out 2; }
+@keyframes deck-shuffle {
+  0%, 100% { transform: translate(-50%,-50%) rotate(0deg); }
+  25% { transform: translate(calc(-50% - 14px),-50%) rotate(-8deg); }
+  50% { transform: translate(calc(-50% + 2px),calc(-50% - 6px)) rotate(2deg); }
+  75% { transform: translate(calc(-50% + 14px),-50%) rotate(8deg); }
+}
+.flying-card {
+  position: fixed; z-index: 45; pointer-events: none; margin: 0;
+}
+
 /* ---------- responsive ---------- */@media (max-width: 640px) {
   #table-wrap { min-height: 380px; }
   .seat { width: 70px; }

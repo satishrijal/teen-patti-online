@@ -35,6 +35,7 @@ const AudioFX = {
   chips() { this.tone(2300, 0.04, 'square', 0.05); this.tone(1750, 0.05, 'square', 0.05, 0.06); },
   turn()  { this.tone(880, 0.12, 'sine', 0.15); this.tone(1174, 0.16, 'sine', 0.13, 0.1); },
   tick()  { this.tone(1250, 0.05, 'square', 0.06); },
+  shuffle() { for (let i = 0; i < 5; i++) this.tone(280 + i * 110, 0.05, 'square', 0.07, i * 0.1); },
   win()   { [523, 659, 784, 1046, 1318].forEach((f, i) => this.tone(f, 0.16, 'triangle', 0.15, i * 0.11)); },
   lose()  { this.tone(220, 0.22, 'sawtooth', 0.09); },
 };
@@ -106,8 +107,9 @@ document.addEventListener('pointerdown', () => Music.start(), { passive: true })
  * only relays signaling (see handleVoice in server.js); all audio is
  * peer-to-peer WebRTC between browsers — the server never hears anything.
  *
- * UX: tap 🎤 once → mic goes live (green). Tap again → muted (you stay in
- * the call, no renegotiation). Tap again → unmute. Leaving the room,
+ * UX: tap 🎤 once → you join the call MUTED (you hear the squad, they
+ * don't hear you). Tap again → mic goes live (green). Tap again → muted.
+ * One tap to talk, one tap to mute — no other states. Leaving the room,
  * logging out, or getting kicked turns voice off completely.
  *
  * Mesh: full mesh between voice-enabled members. To avoid offer glare,
@@ -139,8 +141,8 @@ const Voice = {
     btn.hidden = !inRoom || !this.supported;
     btn.classList.toggle('voice-on', this.enabled && !this.muted);
     btn.classList.toggle('voice-muted', this.enabled && this.muted);
-    btn.title = !this.enabled ? 'Voice chat off — tap to talk'
-      : this.muted ? 'Mic muted — tap to unmute' : 'Mic live — tap to mute';
+    btn.title = !this.enabled ? 'Voice chat off — tap to join (starts muted)'
+      : this.muted ? 'Mic muted — tap to talk' : 'Mic live — tap to mute';
   },
 
   async toggle() {
@@ -164,13 +166,15 @@ const Voice = {
     }
     this.stream = stream;
     this.enabled = true;
-    this.muted = false;
+    // Join MUTED: you hear the squad, they don't hear you. One tap to talk.
+    this.muted = true;
+    for (const t of stream.getAudioTracks()) { try { t.enabled = false; } catch (e) {} }
     this.myUser = auth.username.toLowerCase();
     this.announced = false;
     this.startLevels();
     this.announce(); // sends voice_join if we're seated in a room
     this.updateButton();
-    toast('🎤 Voice on — your squad can hear you.');
+    toast('🎤 Voice on — you\'re muted. Tap 🎤 to talk.');
   },
 
   setMuted(m) {
@@ -579,6 +583,10 @@ function route(msg) {
   } else if (msg.type === 'sideshow_request') {
     AudioFX.turn();
     openSideshowModal(msg);
+  } else if (msg.type === 'reaction') {
+    Reactions.onReaction(msg);
+  } else if (msg.type === 'dealing') {
+    Dealing.onDealing(msg);
   } else if (msg.type === 'error') {
     toast(msg.message, true);
     AudioFX.lose();
@@ -637,7 +645,10 @@ function detectEvents() {
   if (prevState.room.code !== state.room.code) { lastDealtRound = 0; return; }
   if (state.room.phase === 'playing' && state.room.roundNumber !== lastDealtRound) {
     lastDealtRound = state.room.roundNumber;
-    if (prevState.room.phase === 'playing' || prevState.room.result) AudioFX.deal();
+    // The dealing ceremony plays its own sounds; only play the legacy deal
+    // jingle when no ceremony ran (e.g. joined mid-round).
+    if ((prevState.room.phase === 'playing' || prevState.room.result) &&
+        Dealing.playedRound !== state.room.roundNumber) AudioFX.deal();
   }
   // Bets flying to the pot.
   if (state.room.phase === 'playing' && prevState.room.phase === 'playing') {
@@ -844,7 +855,7 @@ function renderTable() {
 
     const bet = p.inRound && p.betInRound > 0 ? `<div class="sbet">🪙${p.betInRound}</div>` : '';
     const dealer = r.dealerId === p.id ? '<div class="dealer-btn">D</div>' : '';
-    const backs = p.inRound && !p.packed
+    const backs = p.inRound && !p.packed && !Dealing.ceremonyActive()
       ? `<div class="mini-cards">${cardBack(true).outerHTML}${cardBack(true).outerHTML}${cardBack(true).outerHTML}</div>` : '';
     const hostMark = p.isHost ? '👑' : '';
     d.innerHTML = `
@@ -860,6 +871,7 @@ function renderTable() {
   renderMyHand();
   renderActions();
   renderFeed();
+  Dealing.maybePlay();
 }
 
 let animatedRound = 0; // round number whose deal animation already played
@@ -873,11 +885,18 @@ function renderMyHand() {
   if (me.cards && me.cards.length === 3) {
     me.cards.forEach((c, i) => box.appendChild(cardEl(c, false, animate, i * 130)));
   } else if (me.inRound && !me.packed) {
-    for (let i = 0; i < 3; i++) box.appendChild(cardBack(false, animate, i * 130));
-    const lbl = document.createElement('div');
-    lbl.className = 'cards-label';
-    lbl.textContent = 'Your cards are face-down (BLIND)';
-    box.appendChild(lbl);
+    if (Dealing.ceremonyActive()) {
+      const lbl = document.createElement('div');
+      lbl.className = 'cards-label';
+      lbl.textContent = '🃏 Dealing…';
+      box.appendChild(lbl);
+    } else {
+      for (let i = 0; i < 3; i++) box.appendChild(cardBack(false, animate, i * 130));
+      const lbl = document.createElement('div');
+      lbl.className = 'cards-label';
+      lbl.textContent = 'Your cards are face-down (BLIND)';
+      box.appendChild(lbl);
+    }
   } else {
     const lbl = document.createElement('div');
     lbl.className = 'cards-label';
@@ -1090,9 +1109,135 @@ setInterval(() => {
   }
 }, 200);
 
+/* ------------------------- table reactions ------------------------- */
+const Reactions = {
+  EMOJI: ['😂', '🔥', '💀', '😎', '🤑', '😭', '👏', '🤡', '❤️', '😱'],
+  buildTray() {
+    const tray = $('#react-tray');
+    tray.innerHTML = '';
+    this.EMOJI.forEach(e => {
+      const b = document.createElement('button');
+      b.textContent = e;
+      b.addEventListener('click', (ev) => { ev.stopPropagation(); this.send(e); });
+      tray.appendChild(b);
+    });
+  },
+  toggle() {
+    const tray = $('#react-tray');
+    if (tray.hidden) {
+      const r = $('#btn-react').getBoundingClientRect();
+      tray.style.top = (r.bottom + 8) + 'px';
+      tray.style.right = Math.max(8, window.innerWidth - r.right) + 'px';
+      tray.hidden = false;
+    } else tray.hidden = true;
+  },
+  hide() { const t = $('#react-tray'); if (t) t.hidden = true; },
+  send(emoji) {
+    this.hide();
+    AudioFX.ensure(); AudioFX.click();
+    send({ type: 'react', emoji });
+  },
+  onReaction(msg) {
+    const seat = document.querySelector(`.seat[data-pid="${msg.fromId}"]`);
+    if (seat) {
+      const d = document.createElement('div');
+      d.className = 'react-float';
+      d.textContent = msg.emoji;
+      seat.appendChild(d);
+      setTimeout(() => d.remove(), 2500);
+    } else {
+      toast(`${msg.fromName}: ${msg.emoji}`);
+    }
+  },
+};
+function updateReactButton() {
+  const btn = $('#btn-react');
+  if (!btn) return;
+  const inRoom = !!(state && state.room && (state.room.phase === 'lobby' || state.room.phase === 'playing'));
+  btn.hidden = !inRoom;
+  if (btn.hidden) Reactions.hide();
+}
+
+/* --------------------- casino dealing ceremony --------------------- */
+// The server deals the hand instantly but broadcasts a timed `dealing`
+// plan first: shuffle at the deck, then one card at a time around the table
+// starting left of the dealer, 3 passes — real-table feel. Seats hide their
+// card backs until the last card lands.
+const Dealing = {
+  plan: null,        // { roundNumber, order, shuffleMs, perCardMs, totalMs }
+  playedRound: 0,    // roundNumber whose ceremony already ran
+  endsAt: 0,
+
+  onDealing(msg) {
+    this.plan = {
+      roundNumber: msg.roundNumber,
+      order: Array.isArray(msg.order) ? msg.order : [],
+      shuffleMs: msg.shuffleMs || 1100,
+      perCardMs: msg.perCardMs || 150,
+      totalMs: msg.totalMs || 3000,
+    };
+  },
+
+  ceremonyActive() {
+    return !!(this.plan && state && this.playedRound === state.room.roundNumber &&
+      Date.now() < this.endsAt);
+  },
+
+  // Called at the end of renderTable, once seats exist in the DOM.
+  maybePlay() {
+    const p = this.plan;
+    if (!p || !state || state.room.roundNumber !== p.roundNumber) return;
+    if (this.playedRound === p.roundNumber) return;
+    this.playedRound = p.roundNumber;
+    this.endsAt = Date.now() + p.totalMs;
+    this.play(p);
+    // When the last card lands, reveal the real table.
+    setTimeout(() => { this.plan = null; render(); }, p.totalMs + 80);
+  },
+
+  play(p) {
+    const wrap = $('#table-wrap');
+    if (!wrap || !p.order.length) return;
+    const deck = document.createElement('div');
+    deck.id = 'deal-deck';
+    deck.appendChild(cardBack(false));
+    wrap.appendChild(deck);
+    AudioFX.shuffle();
+    requestAnimationFrame(() => deck.classList.add('shuffling'));
+    setTimeout(() => {
+      deck.classList.remove('shuffling');
+      p.order.forEach((pid, i) => setTimeout(() => this.flyCard(deck, pid), i * p.perCardMs));
+      setTimeout(() => deck.remove(), p.perCardMs * p.order.length + 500);
+    }, p.shuffleMs);
+  },
+
+  flyCard(deck, pid) {
+    const seat = document.querySelector(`.seat[data-pid="${pid}"]`);
+    if (!seat || !deck.isConnected) return;
+    const a = deck.getBoundingClientRect();
+    const b = seat.getBoundingClientRect();
+    const c = cardBack(true);
+    c.classList.add('flying-card');
+    document.body.appendChild(c);
+    const cr = c.getBoundingClientRect();
+    c.style.left = (a.left + a.width / 2 - cr.width / 2) + 'px';
+    c.style.top = (a.top + a.height / 2 - cr.height / 2) + 'px';
+    AudioFX.tick();
+    const dx = (b.left + b.width / 2) - (a.left + a.width / 2);
+    const dy = (b.top + b.height / 2) - (a.top + a.height / 2);
+    const anim = c.animate([
+      { transform: 'translate(0,0) scale(1)', opacity: 1 },
+      { transform: `translate(${dx * 0.5}px, ${dy * 0.5 - 34}px) scale(1.06)`, opacity: 1, offset: 0.55 },
+      { transform: `translate(${dx}px, ${dy}px) scale(.82)`, opacity: 1 },
+    ], { duration: 270, easing: 'cubic-bezier(.3,.7,.4,1)' });
+    anim.onfinish = () => c.remove();
+  },
+};
+
 /* -------------------------------- render ----------------------------- */
 function render() {
   if (!state) return;
+  updateReactButton();
   if (state.room.phase === 'lobby') renderLobby();
   else renderTable();
 }
@@ -1110,6 +1255,17 @@ function init() {
     if (!AudioFX.muted) AudioFX.click();
   });
   if (AudioFX.muted) $('#btn-mute').textContent = '🔇';
+
+  Reactions.buildTray();
+  $('#btn-react').addEventListener('click', (e) => {
+    e.stopPropagation();
+    AudioFX.ensure(); AudioFX.click();
+    Reactions.toggle();
+  });
+  document.addEventListener('click', (e) => {
+    const tray = $('#react-tray');
+    if (!tray.hidden && !tray.contains(e.target)) Reactions.hide();
+  });
 
   $('#btn-music').addEventListener('click', () => {
     AudioFX.ensure();

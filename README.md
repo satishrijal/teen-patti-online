@@ -72,8 +72,11 @@ ADMIN_USER=satish ADMIN_PASS='pick-something-strong' npm start
   players' cards; every action is validated for turn order, amounts, and eligibility.
   Passwords are salted scrypt hashes that never leave the server.
 - **Table feel** — green felt oval table, avatars, chip stacks, pot in the center,
-  card-dealing + chip-fly animations, turn glow with a 30-second countdown ring
-  (auto-pack on timeout), betting feed, and WebAudio sound effects (mutable).
+  casino dealing ceremony (deck shuffle, then one card at a time around the
+  table starting left of the dealer), chip-fly animations, table reactions
+  (😀 button in the top bar — emoji taunts float over seats), turn glow with
+  a 30-second countdown ring (auto-pack on timeout), betting feed, and
+  WebAudio sound effects (mutable).
 - **Resilience** — if you disconnect, your seat and hand are held for 2 minutes;
   reopen the link and you rejoin automatically (login session + room seat both
   restore). Host migrates if the host drops.
@@ -191,9 +194,10 @@ Talk to your squad live while you play — PUBG-style open mic, no
 push-to-talk needed.
 
 - Tap the **🎤** button (top bar, appears once you're in a room) → your
-  browser asks for mic permission → your mic goes live and the button
-  turns green. Everyone else in the room with voice on hears you.
-- Tap again → **muted** (you stay in the call). Tap again → live again.
+  browser asks for mic permission → you join the call **muted** (you hear
+  everyone, they don't hear you). The button turns red-ish.
+- Tap again → **mic live**, button turns green. Tap again → muted.
+  One tap to talk, one tap to mute — that's the whole thing.
 - Leaving the room, logging out, or losing connection turns voice off.
 - Whoever is speaking gets a **green glow** around their seat/avatar.
 - 🎧 **Headphones strongly recommended** — phone/laptop speakers + open

@@ -350,7 +350,7 @@ function sendState(room) {
         pot: r ? r.pot : 0,
         stake: r ? r.stake : 0,
         boot: BOOT,
-        turnPlayerId: r ? r.turnOrder[r.turnIdx] || null : null,
+        turnPlayerId: r && !r.dealing ? r.turnOrder[r.turnIdx] || null : null,
         turnEndsAt: r ? r.turnEndsAt : null,
         roundNumber: room.roundNumber,
         dealerId: room.dealerId,
@@ -621,6 +621,30 @@ function onToggleReady(ws) {
   sendState(room);
 }
 
+/* ---------------------------- reactions ------------------------------ */
+const REACT_EMOJI = ['😂', '🔥', '💀', '😎', '🤑', '😭', '👏', '🤡', '❤️', '😱'];
+const REACT_COOLDOWN_MS = 3000;
+
+function broadcast(room, obj, exceptId) {
+  for (const p of room.players.values()) {
+    if (p.id !== exceptId && p.ws && p.ws.readyState === 1) send(p, obj);
+  }
+}
+
+// Table reactions: quick emoji taunts that float over a player's seat.
+// Allowlist + cooldown keep it fun instead of spammy.
+function doReact(room, player, emoji) {
+  const e = String(emoji || '');
+  if (!REACT_EMOJI.includes(e)) return 'That reaction is not on the menu.';
+  const now = Date.now();
+  if (player._lastReactAt && now - player._lastReactAt < REACT_COOLDOWN_MS) {
+    return 'Easy on the reactions — give it a second!';
+  }
+  player._lastReactAt = now;
+  broadcast(room, { type: 'reaction', fromId: player.id, fromName: player.name, emoji: e });
+  return null;
+}
+
 /* ------------------------------ rounds ------------------------------- */
 function startRound(room) {
   // Balances live on accounts: reload them so admin top-ups apply.
@@ -665,9 +689,31 @@ function startRound(room) {
   room.phase = 'playing';
   room.lastResult = null;
 
+  // Casino dealing ceremony: the deck shuffles, then one card at a time goes
+  // around the table starting left of the dealer — 3 passes, real-table feel.
+  // The turn timer starts only after the last card lands.
+  round.dealing = true;
+  const dealOrder = [];
+  const nids = ids.length;
+  for (let pass = 0; pass < 3; pass++) {
+    for (let k = 1; k <= nids; k++) dealOrder.push(ids[(dealerIdx + k) % nids]);
+  }
+  const shuffleMs = 1100;
+  const perCardMs = 150;
+  const totalMs = shuffleMs + perCardMs * dealOrder.length;
+  broadcast(room, {
+    type: 'dealing', roundNumber: round.number,
+    order: dealOrder, shuffleMs, perCardMs, totalMs,
+  });
+
   feed(room, `— Round ${round.number} — ${BOOT}-chip boot ante, everyone starts BLIND.`);
-  advanceTurn(room);
   sendState(room);
+  setTimeout(() => {
+    if (room.phase !== 'playing' || room.round !== round) return; // abandoned mid-deal
+    round.dealing = false;
+    advanceTurn(room);
+    sendState(room);
+  }, totalMs);
   return true;
 }
 
@@ -768,6 +814,7 @@ function currentPlayer(room) {
 function requireTurn(room, p) {
   if (room.phase !== 'playing' || !room.round) return 'No round in progress.';
   if (!p.inRound || p.packed) return 'You are not in this hand.';
+  if (room.round.dealing) return 'Cards are still being dealt…';
   if (room.round.sideshow) return 'Waiting on a side show…';
   const cp = currentPlayer(room);
   if (!cp || cp.id !== p.id) return 'Not your turn.';
@@ -1200,6 +1247,7 @@ function handleMessage(ws, raw) {
     case 'bet':           fail(doBet(room, player, msg.kind)); break;
     case 'see_cards':     fail(doSeeCards(room, player)); break;
     case 'pack':          fail(doPack(room, player)); break;
+    case 'react':         fail(doReact(room, player, msg.emoji)); break;
     case 'sideshow':      fail(doSideshowRequest(room, player)); break;
     case 'sideshow_response': fail(doSideshowResponse(room, player, msg.accept)); break;
     case 'show':          fail(doShow(room, player)); break;
@@ -1283,4 +1331,5 @@ if (require.main === module) {
 module.exports = {
   evaluateHand, compareHands, cardCode, newDeck, shuffle,
   BOOT, MAX_PLAYERS, TURN_MS, store,
+  doReact, REACT_EMOJI, REACT_COOLDOWN_MS, broadcast,
 };
